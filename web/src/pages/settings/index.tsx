@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, Fragment } from 'react';
+import { useState, useEffect, useRef, Fragment, useId } from 'react';
 import {
   Settings,
   Monitor,
@@ -24,6 +24,7 @@ import {
   CardTitle,
   Button,
   Input,
+  Label,
   Switch,
   Select,
   SelectContent,
@@ -41,6 +42,24 @@ import { useTransport } from '@/lib/transport/context';
 import type { BackupFile, BackupImportResult } from '@/lib/transport/types';
 import { getDefaultThemes, getLuxuryThemes } from '@/lib/theme';
 import { cn } from '@/lib/utils';
+
+function parseRetentionInteger(value: string): number | null {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return null;
+  }
+
+  if (!/^-?\d+$/.test(trimmed)) {
+    return null;
+  }
+
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
+    return null;
+  }
+
+  return parsed;
+}
 
 export function SettingsPage() {
   const { t } = useTranslation();
@@ -286,49 +305,93 @@ function DataRetentionSection() {
   const { data: settings, isLoading } = useSettings();
   const updateSetting = useUpdateSetting();
   const { t } = useTranslation();
+  const requestRetentionInputId = useId();
+  const sessionRetentionInputId = useId();
+  const requestDetailRetentionInputId = useId();
 
   const requestRetentionHours = settings?.request_retention_hours ?? '168';
+  const sessionRetentionHours = settings?.session_retention_hours ?? '168';
   const requestDetailRetentionSeconds = settings?.request_detail_retention_seconds ?? '-1';
 
   const [requestDraft, setRequestDraft] = useState('');
+  const [sessionDraft, setSessionDraft] = useState('');
   const [detailDraft, setDetailDraft] = useState('');
+  const [validationError, setValidationError] = useState('');
   const [initialized, setInitialized] = useState(false);
 
   useEffect(() => {
     if (!isLoading && !initialized) {
       setRequestDraft(requestRetentionHours);
+      setSessionDraft(sessionRetentionHours);
       setDetailDraft(requestDetailRetentionSeconds);
       setInitialized(true);
     }
-  }, [isLoading, initialized, requestRetentionHours, requestDetailRetentionSeconds]);
-
-  useEffect(() => {
-    if (initialized) {
-      setRequestDraft(requestRetentionHours);
-      setDetailDraft(requestDetailRetentionSeconds);
-    }
-  }, [requestRetentionHours, requestDetailRetentionSeconds, initialized]);
+  }, [
+    isLoading,
+    initialized,
+    requestRetentionHours,
+    sessionRetentionHours,
+    requestDetailRetentionSeconds,
+  ]);
 
   const hasChanges =
     initialized &&
-    (requestDraft !== requestRetentionHours || detailDraft !== requestDetailRetentionSeconds);
+    (requestDraft !== requestRetentionHours ||
+      sessionDraft !== sessionRetentionHours ||
+      detailDraft !== requestDetailRetentionSeconds);
+
+  useEffect(() => {
+    // 仅在本地没有未保存修改时，才用服务端最新值回填表单
+    if (initialized && !hasChanges) {
+      setRequestDraft(requestRetentionHours);
+      setSessionDraft(sessionRetentionHours);
+      setDetailDraft(requestDetailRetentionSeconds);
+    }
+  }, [
+    requestRetentionHours,
+    sessionRetentionHours,
+    requestDetailRetentionSeconds,
+    initialized,
+    hasChanges,
+  ]);
+
+  useEffect(() => {
+    setValidationError((current) => (current ? '' : current));
+  }, [requestDraft, sessionDraft, detailDraft]);
 
   const handleSave = async () => {
-    const requestNum = parseInt(requestDraft, 10);
-    const detailNum = parseInt(detailDraft, 10);
+    const requestNum = parseRetentionInteger(requestDraft);
+    const sessionNum = parseRetentionInteger(sessionDraft);
+    const detailNum = parseRetentionInteger(detailDraft);
+    const updates: Array<{ key: string; value: string }> = [];
 
-    if (!isNaN(requestNum) && requestNum >= 0 && requestDraft !== requestRetentionHours) {
-      await updateSetting.mutateAsync({
-        key: 'request_retention_hours',
-        value: requestDraft,
-      });
+    if (requestDraft !== requestRetentionHours) {
+      if (requestNum === null || requestNum < 0) {
+        setValidationError(t('settings.retentionValidationError'));
+        return;
+      }
+      updates.push({ key: 'request_retention_hours', value: String(requestNum) });
     }
 
-    if (!isNaN(detailNum) && detailNum >= -1 && detailDraft !== requestDetailRetentionSeconds) {
-      await updateSetting.mutateAsync({
-        key: 'request_detail_retention_seconds',
-        value: detailDraft,
-      });
+    if (sessionDraft !== sessionRetentionHours) {
+      if (sessionNum === null || sessionNum < 0) {
+        setValidationError(t('settings.retentionValidationError'));
+        return;
+      }
+      updates.push({ key: 'session_retention_hours', value: String(sessionNum) });
+    }
+
+    if (detailDraft !== requestDetailRetentionSeconds) {
+      if (detailNum === null || detailNum < -1) {
+        setValidationError(t('settings.retentionValidationError'));
+        return;
+      }
+      updates.push({ key: 'request_detail_retention_seconds', value: String(detailNum) });
+    }
+
+    setValidationError('');
+    for (const update of updates) {
+      await updateSetting.mutateAsync(update);
     }
   };
 
@@ -351,36 +414,77 @@ function DataRetentionSection() {
         </div>
       </CardHeader>
       <CardContent className="space-y-4">
-        <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3">
-          <div className="text-sm font-medium text-muted-foreground shrink-0">
-            {t('settings.requestRetentionHours')}
+        {validationError && <p className="text-xs text-destructive">{validationError}</p>}
+        <div className="space-y-1.5">
+          <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3">
+            <Label
+              htmlFor={requestRetentionInputId}
+              className="text-sm font-medium text-muted-foreground shrink-0"
+            >
+              {t('settings.requestRetentionHours')}
+            </Label>
+            <Input
+              id={requestRetentionInputId}
+              type="number"
+              value={requestDraft}
+              onChange={(e) => setRequestDraft(e.target.value)}
+              className="w-24"
+              min={0}
+              step={1}
+              disabled={updateSetting.isPending}
+            />
+            <span className="text-xs text-muted-foreground">{t('common.hours')}</span>
           </div>
-          <Input
-            type="number"
-            value={requestDraft}
-            onChange={(e) => setRequestDraft(e.target.value)}
-            className="w-24"
-            min={0}
-            disabled={updateSetting.isPending}
-          />
-          <span className="text-xs text-muted-foreground">{t('common.hours')}</span>
+          <p className="text-xs text-muted-foreground">{t('settings.requestRetentionHoursDesc')}</p>
         </div>
 
-        <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3 pt-4 border-t border-border">
-          <div className="text-sm font-medium text-muted-foreground shrink-0">
-            {t('settings.requestDetailRetention')}
+        <div className="space-y-1.5 pt-4 border-t border-border">
+          <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3">
+            <Label
+              htmlFor={sessionRetentionInputId}
+              className="text-sm font-medium text-muted-foreground shrink-0"
+            >
+              {t('settings.sessionRetentionHours')}
+            </Label>
+            <Input
+              id={sessionRetentionInputId}
+              type="number"
+              value={sessionDraft}
+              onChange={(e) => setSessionDraft(e.target.value)}
+              className="w-24"
+              min={0}
+              step={1}
+              disabled={updateSetting.isPending}
+            />
+            <span className="text-xs text-muted-foreground">{t('common.hours')}</span>
           </div>
-          <Input
-            type="number"
-            value={detailDraft}
-            onChange={(e) => setDetailDraft(e.target.value)}
-            className="w-24"
-            min={-1}
-            disabled={updateSetting.isPending}
-          />
-          <span className="text-xs text-muted-foreground">{t('common.seconds')}</span>
+          <p className="text-xs text-muted-foreground">{t('settings.sessionRetentionHoursDesc')}</p>
         </div>
-        <p className="text-xs text-muted-foreground">{t('settings.requestDetailRetentionDesc')}</p>
+
+        <div className="space-y-1.5 pt-4 border-t border-border">
+          <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3">
+            <Label
+              htmlFor={requestDetailRetentionInputId}
+              className="text-sm font-medium text-muted-foreground shrink-0"
+            >
+              {t('settings.requestDetailRetention')}
+            </Label>
+            <Input
+              id={requestDetailRetentionInputId}
+              type="number"
+              value={detailDraft}
+              onChange={(e) => setDetailDraft(e.target.value)}
+              className="w-24"
+              min={-1}
+              step={1}
+              disabled={updateSetting.isPending}
+            />
+            <span className="text-xs text-muted-foreground">{t('common.seconds')}</span>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            {t('settings.requestDetailRetentionDesc')}
+          </p>
+        </div>
       </CardContent>
     </Card>
   );
