@@ -357,6 +357,7 @@ func main() {
 	proxyHandler := handler.NewProxyHandler(clientAdapter, requestExecutor, cachedSessionRepo, tokenAuthMiddleware)
 	proxyHandler.SetRequestTracker(requestTracker)
 	adminHandler := handler.NewAdminHandler(adminService, backupService, logPath)
+	selfServiceHandler := handler.NewSelfServiceHandler(adminService)
 	adminHandler.SetUserRepo(userRepo)
 	adminHandler.SetAuthEnabled(authEnabled)
 	authHandler := handler.NewAuthHandler(
@@ -387,9 +388,9 @@ func main() {
 
 	// Admin API routes with authentication middleware
 	if authMiddleware != nil {
-		mux.Handle("/api/admin/", http.StripPrefix("/api", authMiddleware.Wrap(adminHandler)))
+		handler.RegisterSelfServiceRoutes(mux, authMiddleware.Wrap, adminHandler, selfServiceHandler)
 	} else {
-		mux.Handle("/api/admin/", http.StripPrefix("/api", handler.NoAuthMiddleware(adminHandler)))
+		handler.RegisterSelfServiceRoutes(mux, handler.NoAuthMiddleware, adminHandler, selfServiceHandler)
 	}
 
 	// Other API routes (no authentication required)

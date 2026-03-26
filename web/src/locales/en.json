@@ -248,6 +248,8 @@
     "multiplier": "Multiplier",
     "costMismatchTitle": "Front-end calculation differs from backend",
     "calculatedCost": "(calc: {{cost}})",
+    "loadingProxyStatus": "Loading proxy status",
+    "proxyStatusLoadFailed": "Failed to load proxy status: {{message}}",
     "diff": {
       "addedUpstream": "Added in Upstream",
       "removedClient": "Removed from Client",
@@ -264,6 +266,9 @@
     "noProvidersHint": "Click \"Add Provider\" to create one",
     "importProviders": "Import Providers",
     "exportProviders": "Export Providers",
+    "readOnlyHint": "Read-only for members. Admin access required to edit providers.",
+    "importProvidersAdminOnly": "Only admins can import providers.",
+    "addProviderAdminOnly": "Only admins can add providers.",
     "importCompleted": "Import completed: {{imported}} imported, {{skipped}} skipped",
     "refreshQuotas": "Refresh quotas for all Antigravity providers",
     "refreshCodex": "Refresh subscription info for all Codex providers",
