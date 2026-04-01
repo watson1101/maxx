@@ -67,11 +67,11 @@ func (a *CodexAdapter) SetProviderUpdateFunc(fn ProviderUpdateFunc) {
 }
 
 func NewAdapter(p *domain.Provider) (provider.ProviderAdapter, error) {
-	if p.Config == nil || p.Config.Codex == nil {
-		return nil, fmt.Errorf("provider %s missing codex config", p.Name)
-	}
+	config := ensureCodexConfig(p)
 
-	config := p.Config.Codex
+	// Persist the synthesized config back onto the provider so downstream update callbacks
+	// and retry logic observe a consistent shape.
+	p.Config.Codex = config
 
 	// If UseCLIProxyAPI is enabled, directly return CLIProxyAPI adapter
 	if config.UseCLIProxyAPI {
@@ -261,7 +261,7 @@ func (a *CodexAdapter) getAccessToken(ctx context.Context) (string, error) {
 	// Check cache
 	a.tokenMu.RLock()
 	if a.tokenCache.AccessToken != "" {
-		if a.tokenCache.ExpiresAt.IsZero() || time.Now().Add(60*time.Second).Before(a.tokenCache.ExpiresAt) {
+		if !isFallbackCodexAccessToken(a.tokenCache.AccessToken) && (a.tokenCache.ExpiresAt.IsZero() || time.Now().Add(60*time.Second).Before(a.tokenCache.ExpiresAt)) {
 			token := a.tokenCache.AccessToken
 			a.tokenMu.RUnlock()
 			return token, nil
@@ -270,8 +270,8 @@ func (a *CodexAdapter) getAccessToken(ctx context.Context) (string, error) {
 	a.tokenMu.RUnlock()
 
 	// Use persisted access token if present (even if expiry is unknown)
-	config := a.provider.Config.Codex
-	if strings.TrimSpace(config.AccessToken) != "" {
+	config := ensureCodexConfig(a.provider)
+	if strings.TrimSpace(config.AccessToken) != "" && !isFallbackCodexAccessToken(config.AccessToken) {
 		var expiresAt time.Time
 		if strings.TrimSpace(config.ExpiresAt) != "" {
 			if parsed, err := time.Parse(time.RFC3339, config.ExpiresAt); err == nil {
@@ -291,9 +291,29 @@ func (a *CodexAdapter) getAccessToken(ctx context.Context) (string, error) {
 	}
 
 	// Refresh token
+	if strings.TrimSpace(config.RefreshToken) == "" {
+		log.Printf("[Codex] level=INFO trigger=fallback provider=%q provider_id=%d reason=missing_refresh_token message=%q",
+			a.provider.Name,
+			a.provider.ID,
+			"codex provider config missing refresh token; using placeholder local token for fallback flow",
+		)
+		fallbackToken := buildFallbackCodexAccessToken(a.provider)
+		a.tokenMu.Lock()
+		a.tokenCache = &TokenCache{AccessToken: fallbackToken}
+		a.tokenMu.Unlock()
+		config.AccessToken = fallbackToken
+		config.ExpiresAt = time.Now().Add(5 * time.Second).Format(time.RFC3339)
+		if a.providerUpdate != nil {
+			if err := a.providerUpdate(a.provider); err != nil {
+				log.Printf("[Codex] failed to persist fallback token: %v", err)
+			}
+		}
+		return fallbackToken, nil
+	}
+
 	tokenResp, err := RefreshAccessToken(ctx, config.RefreshToken)
 	if err != nil {
-		if strings.TrimSpace(config.AccessToken) != "" {
+		if strings.TrimSpace(config.AccessToken) != "" && !isFallbackCodexAccessToken(config.AccessToken) {
 			return config.AccessToken, nil
 		}
 		return "", err
@@ -687,7 +707,6 @@ func extractModelFromResponse(body []byte) string {
 	}
 	return ""
 }
-
 
 // applyCodexHeaders applies headers for Codex API requests
 // It follows the CLIProxyAPI pattern: passthrough client headers, use defaults only when missing

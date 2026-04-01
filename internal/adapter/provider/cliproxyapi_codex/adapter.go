@@ -17,11 +17,11 @@ import (
 	"github.com/awsl-project/maxx/internal/domain"
 	"github.com/awsl-project/maxx/internal/flow"
 	"github.com/awsl-project/maxx/internal/usage"
-	"github.com/tidwall/sjson"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/exec"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	"github.com/tidwall/sjson"
 )
 
 // TokenCache caches access tokens
@@ -47,15 +47,12 @@ func (a *CLIProxyAPICodexAdapter) SetProviderUpdateFunc(fn func(*domain.Provider
 // codexConfig returns the Codex config from the provider.
 // CPA adapter always uses ProviderConfigCodex (the real provider's config).
 func (a *CLIProxyAPICodexAdapter) codexConfig() *domain.ProviderConfigCodex {
-	return a.provider.Config.Codex
+	return ensureCodexConfig(a.provider)
 }
 
 func NewAdapter(p *domain.Provider) (provider.ProviderAdapter, error) {
-	if p.Config == nil || p.Config.Codex == nil {
-		return nil, fmt.Errorf("provider %s missing codex config", p.Name)
-	}
-
-	cfg := p.Config.Codex
+	cfg := ensureCodexConfig(p)
+	p.Config.Codex = cfg
 
 	// 创建 Auth 对象
 	metadata := map[string]any{
@@ -110,7 +107,7 @@ func (a *CLIProxyAPICodexAdapter) getAccessToken(ctx context.Context) (string, e
 	// 检查缓存
 	a.tokenMu.RLock()
 	if a.tokenCache.AccessToken != "" {
-		if a.tokenCache.ExpiresAt.IsZero() || time.Now().Add(60*time.Second).Before(a.tokenCache.ExpiresAt) {
+		if !isFallbackCodexAccessToken(a.tokenCache.AccessToken) && (a.tokenCache.ExpiresAt.IsZero() || time.Now().Add(60*time.Second).Before(a.tokenCache.ExpiresAt)) {
 			token := a.tokenCache.AccessToken
 			a.tokenMu.RUnlock()
 			return token, nil
@@ -126,7 +123,7 @@ func (a *CLIProxyAPICodexAdapter) getAccessToken(ctx context.Context) (string, e
 	cfgRefreshToken := cfg.RefreshToken
 	a.tokenMu.RUnlock()
 
-	if cfgAccessToken != "" {
+	if cfgAccessToken != "" && !isFallbackCodexAccessToken(cfgAccessToken) {
 		var expiresAt time.Time
 		if cfgExpiresAt != "" {
 			if parsed, err := time.Parse(time.RFC3339, cfgExpiresAt); err == nil {
@@ -146,10 +143,34 @@ func (a *CLIProxyAPICodexAdapter) getAccessToken(ctx context.Context) (string, e
 	}
 
 	// 刷新 token
+	if strings.TrimSpace(cfgRefreshToken) == "" {
+		log.Printf("[CLIProxyAPI-Codex] level=INFO trigger=fallback provider=%q provider_id=%d reason=missing_refresh_token message=%q",
+			a.provider.Name,
+			a.provider.ID,
+			"codex provider config missing refresh token; using placeholder local token for fallback flow",
+		)
+		fallbackToken := buildFallbackCodexAccessToken(a.provider)
+		a.tokenMu.Lock()
+		a.tokenCache = &TokenCache{AccessToken: fallbackToken}
+		a.tokenMu.Unlock()
+		cfg.AccessToken = fallbackToken
+		cfg.ExpiresAt = time.Now().Add(5 * time.Second).Format(time.RFC3339)
+		if a.authObj.Metadata == nil {
+			a.authObj.Metadata = make(map[string]any)
+		}
+		a.authObj.Metadata["access_token"] = fallbackToken
+		if a.providerUpdate != nil {
+			if err := a.providerUpdate(a.provider); err != nil {
+				log.Printf("[CLIProxyAPI-Codex] failed to persist fallback token: %v", err)
+			}
+		}
+		return fallbackToken, nil
+	}
+
 	tokenResp, err := refreshAccessToken(ctx, cfgRefreshToken)
 	if err != nil {
 		// 刷新失败时，如果有旧 token 就兜底使用
-		if cfgAccessToken != "" {
+		if cfgAccessToken != "" && !isFallbackCodexAccessToken(cfgAccessToken) {
 			return cfgAccessToken, nil
 		}
 		return "", err
@@ -431,9 +452,10 @@ type tokenResponse struct {
 }
 
 const (
-	openAITokenURL = "https://auth.openai.com/oauth/token"
-	oauthClientID  = "app_EMoamEEZ73f0CkXaXp7hrann"
+	oauthClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
 )
+
+var openAITokenURL = "https://auth.openai.com/oauth/token"
 
 // refreshAccessToken refreshes the access token using a refresh token
 func refreshAccessToken(ctx context.Context, refreshToken string) (*tokenResponse, error) {
