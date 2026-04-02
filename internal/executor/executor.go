@@ -84,7 +84,9 @@ func (e *Executor) Execute(ctx context.Context, w http.ResponseWriter, req *http
 // ExecuteWith runs the executor middleware chain using an existing flow context.
 func (e *Executor) ExecuteWith(c *flow.Ctx) error {
 	if c == nil {
-		return domain.NewProxyErrorWithMessage(domain.ErrInvalidInput, false, "flow context missing")
+		proxyErr := domain.NewProxyErrorWithMessage(domain.ErrInvalidInput, false, "flow context missing")
+		proxyErr.Scope = domain.ScopeRequest
+		return proxyErr
 	}
 	ctx := context.Background()
 	if v, ok := c.Get(flow.KeyProxyContext); ok {
