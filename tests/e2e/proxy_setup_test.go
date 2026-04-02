@@ -45,7 +45,7 @@ func NewProxyTestEnv(t *testing.T) *ProxyTestEnv {
 
 	// Clear global cooldown state from previous tests (singleton is shared across tests)
 	for i := uint64(1); i <= 10; i++ {
-		cooldown.Default().ClearCooldown(i, "")
+		cooldown.Default().ClearCooldown(i, "", "")
 	}
 
 	dsn := fmt.Sprintf("file:proxytest_%d?mode=memory&cache=shared&_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)", time.Now().UnixNano())
@@ -288,6 +288,21 @@ func (e *ProxyTestEnv) doRequest(method, path string, body any, token string) *h
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		e.t.Fatalf("Request failed: %v", err)
+	}
+	return resp
+}
+
+// AdminGet sends an authenticated GET request to the given path.
+func (e *ProxyTestEnv) AdminGet(path string) *http.Response {
+	e.t.Helper()
+	req, err := http.NewRequest(http.MethodGet, e.URL(path), nil)
+	if err != nil {
+		e.t.Fatalf("Failed to create request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+e.Token)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		e.t.Fatalf("Request failed: %v", err)
