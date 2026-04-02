@@ -61,6 +61,7 @@ const REQUEST_PROJECT_FILTER_STORAGE_KEY = 'maxx-requests-project-filter';
 const REQUESTS_VIRTUALIZE_THRESHOLD = 40;
 const DEFAULT_DESKTOP_ROW_HEIGHT = 38;
 
+/** Reads a positive numeric value from localStorage, returning undefined if absent or invalid. */
 function readStoredNumber(key: string): number | undefined {
   if (typeof window === 'undefined') {
     return undefined;
@@ -76,6 +77,7 @@ function readStoredNumber(key: string): number | undefined {
   return parsed;
 }
 
+/** Maps each proxy request status to its corresponding badge variant. */
 export const statusVariant: Record<
   ProxyRequestStatus,
   'default' | 'success' | 'warning' | 'danger' | 'info'
@@ -88,6 +90,7 @@ export const statusVariant: Record<
   REJECTED: 'danger',
 };
 
+/** Main requests monitoring page with filtering, infinite scroll, and real-time updates. */
 export function RequestsPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -138,10 +141,9 @@ export function RequestsPage() {
     filterMode === 'token' && selectedTokenId !== undefined && !apiTokensIsSuccess;
   const waitingProjectFilterValidation =
     filterMode === 'project' && selectedProjectId !== undefined && !projectsIsSuccess;
-  const requestsQueryEnabled =
-    !waitingProviderFilterValidation &&
-    !waitingTokenFilterValidation &&
-    !waitingProjectFilterValidation;
+  const waitingFilterValidation =
+    waitingProviderFilterValidation || waitingTokenFilterValidation || waitingProjectFilterValidation;
+  const requestsQueryEnabled = !waitingFilterValidation;
 
   // 使用 Infinite Query
   const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isLoading, isFetching, refetch } =
@@ -187,8 +189,11 @@ export function RequestsPage() {
   const allRequests = useMemo(() => {
     return data?.pages.flatMap((page) => page.items) ?? [];
   }, [data]);
+  // Show spinner on initial load, manual refresh with empty list, or while
+  // waiting for filter dependencies. When switching filters with existing cache,
+  // stale-while-revalidate keeps old data visible, avoiding a jarring flash.
   const showLoadingState =
-    (isLoading || isFetching || !requestsQueryEnabled) && allRequests.length === 0;
+    (isLoading || isFetching || waitingFilterValidation) && allRequests.length === 0;
   const hasRenderedRequests = allRequests.length > 0;
 
   const activeCount = useMemo(() => {
@@ -495,12 +500,12 @@ export function RequestsPage() {
         <StatusFilter selectedStatus={selectedStatus} onSelect={handleStatusFilterChange} />
         <button
           onClick={handleRefresh}
-          disabled={isFetching || !requestsQueryEnabled}
+          disabled={isFetching || waitingFilterValidation}
           className={cn(
             'flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-all',
             'bg-muted/50 hover:bg-muted border border-border/50 hover:border-border',
             'text-muted-foreground hover:text-foreground',
-            (isFetching || !requestsQueryEnabled) && 'opacity-50 cursor-not-allowed',
+            (isFetching || waitingFilterValidation) && 'opacity-50 cursor-not-allowed',
           )}
         >
           <RefreshCw size={14} className={isFetching ? 'animate-spin' : ''} />
