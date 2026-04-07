@@ -16,6 +16,7 @@ import (
 	"github.com/awsl-project/maxx/internal/adapter/provider"
 	"github.com/awsl-project/maxx/internal/domain"
 	"github.com/awsl-project/maxx/internal/flow"
+	"github.com/awsl-project/maxx/internal/payloadoverride"
 	"github.com/awsl-project/maxx/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -63,9 +64,15 @@ func NewAdapter(p *domain.Provider) (provider.ProviderAdapter, error) {
 		metadata["account_id"] = cfg.AccountID
 	}
 
+	attributes := map[string]string{}
+	if baseURL := strings.TrimSpace(cfg.BaseURL); baseURL != "" {
+		attributes["base_url"] = baseURL
+	}
+
 	authObj := &auth.Auth{
-		Provider: "codex",
-		Metadata: metadata,
+		Provider:   "codex",
+		Attributes: attributes,
+		Metadata:   metadata,
 	}
 
 	adapter := &CLIProxyAPICodexAdapter{
@@ -246,6 +253,7 @@ func (a *CLIProxyAPICodexAdapter) Execute(c *flow.Ctx, p *domain.Provider) error
 			requestBody = updated
 		}
 	}
+	requestBody = payloadoverride.ApplyGlobal(requestBody, "codex", model)
 
 	// Codex CLI 请求体本质是 OpenAI Responses schema；保持与 CLIProxyAPI 一致。
 	sourceFormat := translator.FormatOpenAIResponse
