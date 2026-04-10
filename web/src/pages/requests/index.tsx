@@ -39,6 +39,7 @@ import {
 import { cn } from '@/lib/utils';
 import { PageHeader } from '@/components/layout/page-header';
 import { useIsMobile } from '@/hooks/use-mobile';
+import { useAuth } from '@/lib/auth-context';
 import { calculateVirtualRange } from './virtual-range';
 
 type ProviderTypeKey = 'antigravity' | 'kiro' | 'codex' | 'custom';
@@ -81,6 +82,84 @@ function readStoredNumber(key: string): number | undefined {
   return parsed;
 }
 
+function readStoredNumberWithLegacy(key: string, legacyKey?: string): number | undefined {
+  const scopedValue = readStoredNumber(key);
+  if (scopedValue !== undefined || !legacyKey) {
+    return scopedValue;
+  }
+  return readStoredNumber(legacyKey);
+}
+
+function readStoredFilterMode(key: string, legacyKey?: string): RequestFilterMode {
+  if (typeof window === 'undefined') {
+    return 'token';
+  }
+  const stored = window.localStorage.getItem(key);
+  if (stored === 'provider' || stored === 'project') {
+    return stored;
+  }
+  if (stored === 'token') {
+    return 'token';
+  }
+  if (legacyKey) {
+    const legacyStored = window.localStorage.getItem(legacyKey);
+    if (legacyStored === 'provider' || legacyStored === 'project') {
+      return legacyStored;
+    }
+  }
+  return 'token';
+}
+
+function migrateLegacyRequestFilterValue(scopedKey: string, legacyKey: string): void {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  const scopedValue = window.localStorage.getItem(scopedKey);
+  const legacyValue = window.localStorage.getItem(legacyKey);
+
+  if (scopedValue !== null || legacyValue === null) {
+    return;
+  }
+
+  window.localStorage.setItem(scopedKey, legacyValue);
+  window.localStorage.removeItem(legacyKey);
+}
+
+function migrateLegacyRequestFilters({
+  modeKey,
+  providerKey,
+  tokenKey,
+  projectKey,
+}: {
+  modeKey: string;
+  providerKey: string;
+  tokenKey: string;
+  projectKey: string;
+}) {
+  migrateLegacyRequestFilterValue(modeKey, REQUEST_FILTER_MODE_STORAGE_KEY);
+  migrateLegacyRequestFilterValue(providerKey, REQUEST_PROVIDER_FILTER_STORAGE_KEY);
+  migrateLegacyRequestFilterValue(tokenKey, REQUEST_TOKEN_FILTER_STORAGE_KEY);
+  migrateLegacyRequestFilterValue(projectKey, REQUEST_PROJECT_FILTER_STORAGE_KEY);
+}
+
+function removeLegacyRequestFilters() {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  window.localStorage.removeItem(REQUEST_FILTER_MODE_STORAGE_KEY);
+  window.localStorage.removeItem(REQUEST_PROVIDER_FILTER_STORAGE_KEY);
+  window.localStorage.removeItem(REQUEST_TOKEN_FILTER_STORAGE_KEY);
+  window.localStorage.removeItem(REQUEST_PROJECT_FILTER_STORAGE_KEY);
+}
+
+function buildScopedStorageKey(baseKey: string, tenantID?: number, userID?: number): string {
+  if (!tenantID || !userID) {
+    return `${baseKey}:anonymous`;
+  }
+  return `${baseKey}:tenant-${tenantID}:user-${userID}`;
+}
+
 /** Maps each proxy request status to its corresponding badge variant. */
 export const statusVariant: Record<
   ProxyRequestStatus,
@@ -99,27 +178,40 @@ export function RequestsPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const isMobile = useIsMobile();
+  const { user } = useAuth();
+
+  const filterModeStorageKey = useMemo(
+    () => buildScopedStorageKey(REQUEST_FILTER_MODE_STORAGE_KEY, user?.tenantID, user?.id),
+    [user?.id, user?.tenantID],
+  );
+  const providerFilterStorageKey = useMemo(
+    () => buildScopedStorageKey(REQUEST_PROVIDER_FILTER_STORAGE_KEY, user?.tenantID, user?.id),
+    [user?.id, user?.tenantID],
+  );
+  const tokenFilterStorageKey = useMemo(
+    () => buildScopedStorageKey(REQUEST_TOKEN_FILTER_STORAGE_KEY, user?.tenantID, user?.id),
+    [user?.id, user?.tenantID],
+  );
+  const projectFilterStorageKey = useMemo(
+    () => buildScopedStorageKey(REQUEST_PROJECT_FILTER_STORAGE_KEY, user?.tenantID, user?.id),
+    [user?.id, user?.tenantID],
+  );
 
   // 过滤维度（默认令牌）
-  const [filterMode, setFilterMode] = useState<RequestFilterMode>(() => {
-    if (typeof window === 'undefined') {
-      return 'token';
-    }
-    const stored = window.localStorage.getItem(REQUEST_FILTER_MODE_STORAGE_KEY);
-    if (stored === 'provider' || stored === 'project') return stored;
-    return 'token';
-  });
+  const [filterMode, setFilterMode] = useState<RequestFilterMode>(() =>
+    readStoredFilterMode(filterModeStorageKey, REQUEST_FILTER_MODE_STORAGE_KEY),
+  );
   // Provider 过滤器
   const [selectedProviderId, setSelectedProviderId] = useState<number | undefined>(() =>
-    readStoredNumber(REQUEST_PROVIDER_FILTER_STORAGE_KEY),
+    readStoredNumberWithLegacy(providerFilterStorageKey, REQUEST_PROVIDER_FILTER_STORAGE_KEY),
   );
   // Token 过滤器
   const [selectedTokenId, setSelectedTokenId] = useState<number | undefined>(() =>
-    readStoredNumber(REQUEST_TOKEN_FILTER_STORAGE_KEY),
+    readStoredNumberWithLegacy(tokenFilterStorageKey, REQUEST_TOKEN_FILTER_STORAGE_KEY),
   );
   // Project 过滤器
   const [selectedProjectId, setSelectedProjectId] = useState<number | undefined>(() =>
-    readStoredNumber(REQUEST_PROJECT_FILTER_STORAGE_KEY),
+    readStoredNumberWithLegacy(projectFilterStorageKey, REQUEST_PROJECT_FILTER_STORAGE_KEY),
   );
   // Status 过滤器
   const [selectedStatus, setSelectedStatus] = useState<string | undefined>(undefined);
@@ -305,44 +397,77 @@ export function RequestsPage() {
   }, [hasNextPage, isFetchingNextPage, fetchNextPage]);
 
   useEffect(() => {
+    migrateLegacyRequestFilters({
+      modeKey: filterModeStorageKey,
+      providerKey: providerFilterStorageKey,
+      tokenKey: tokenFilterStorageKey,
+      projectKey: projectFilterStorageKey,
+    });
+
+    setFilterMode(readStoredFilterMode(filterModeStorageKey, REQUEST_FILTER_MODE_STORAGE_KEY));
+    setSelectedProviderId(
+      readStoredNumberWithLegacy(providerFilterStorageKey, REQUEST_PROVIDER_FILTER_STORAGE_KEY),
+    );
+    setSelectedTokenId(
+      readStoredNumberWithLegacy(tokenFilterStorageKey, REQUEST_TOKEN_FILTER_STORAGE_KEY),
+    );
+    setSelectedProjectId(
+      readStoredNumberWithLegacy(projectFilterStorageKey, REQUEST_PROJECT_FILTER_STORAGE_KEY),
+    );
+    setSelectedStatus(undefined);
+  }, [
+    filterModeStorageKey,
+    projectFilterStorageKey,
+    providerFilterStorageKey,
+    tokenFilterStorageKey,
+  ]);
+
+  useEffect(() => {
     if (typeof window === 'undefined') {
       return;
     }
-    window.localStorage.setItem(REQUEST_FILTER_MODE_STORAGE_KEY, filterMode);
-  }, [filterMode]);
+    window.localStorage.setItem(filterModeStorageKey, filterMode);
+    removeLegacyRequestFilters();
+  }, [filterMode, filterModeStorageKey]);
 
   useEffect(() => {
     if (typeof window === 'undefined') {
       return;
     }
     if (selectedProviderId === undefined) {
+      window.localStorage.removeItem(providerFilterStorageKey);
       window.localStorage.removeItem(REQUEST_PROVIDER_FILTER_STORAGE_KEY);
       return;
     }
-    window.localStorage.setItem(REQUEST_PROVIDER_FILTER_STORAGE_KEY, String(selectedProviderId));
-  }, [selectedProviderId]);
+    window.localStorage.setItem(providerFilterStorageKey, String(selectedProviderId));
+    window.localStorage.removeItem(REQUEST_PROVIDER_FILTER_STORAGE_KEY);
+  }, [providerFilterStorageKey, selectedProviderId]);
 
   useEffect(() => {
     if (typeof window === 'undefined') {
       return;
     }
     if (selectedTokenId === undefined) {
+      window.localStorage.removeItem(tokenFilterStorageKey);
       window.localStorage.removeItem(REQUEST_TOKEN_FILTER_STORAGE_KEY);
       return;
     }
-    window.localStorage.setItem(REQUEST_TOKEN_FILTER_STORAGE_KEY, String(selectedTokenId));
-  }, [selectedTokenId]);
+    window.localStorage.setItem(tokenFilterStorageKey, String(selectedTokenId));
+    window.localStorage.removeItem(REQUEST_TOKEN_FILTER_STORAGE_KEY);
+  }, [selectedTokenId, tokenFilterStorageKey]);
 
   useEffect(() => {
     if (typeof window === 'undefined') {
       return;
     }
     if (selectedProjectId === undefined) {
+      window.localStorage.removeItem(projectFilterStorageKey);
       window.localStorage.removeItem(REQUEST_PROJECT_FILTER_STORAGE_KEY);
       return;
     }
-    window.localStorage.setItem(REQUEST_PROJECT_FILTER_STORAGE_KEY, String(selectedProjectId));
-  }, [selectedProjectId]);
+    window.localStorage.setItem(projectFilterStorageKey, String(selectedProjectId));
+    window.localStorage.removeItem(REQUEST_PROJECT_FILTER_STORAGE_KEY);
+  }, [projectFilterStorageKey, selectedProjectId]);
 
   useEffect(() => {
     if (!providersIsSuccess || selectedProviderId === undefined) {
