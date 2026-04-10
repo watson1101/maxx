@@ -106,22 +106,71 @@ func (a *CustomAdapter) Execute(c *flow.Ctx, provider *domain.Provider) error {
 	switch clientType {
 	case domain.ClientTypeClaude:
 		// Claude: Following CLIProxyAPI pattern
-		// 1. Process body first (get extraBetas, inject cloaking/cache_control)
-		apiKey := a.provider.Config.Custom.APIKey
+		// 1. Process body first (apply disguise + structural fixes, return extra betas)
+		customCfg := a.provider.Config.Custom
+		apiKey := customCfg.APIKey
 		clientUA := ""
 		if request != nil {
 			clientUA = request.Header.Get("User-Agent")
 		}
 		var extraBetas []string
-		requestBody, extraBetas = processClaudeRequestBody(requestBody, clientUA, a.provider.Config.Custom.Cloak)
+		requestBody, extraBetas = processClaudeRequestBody(requestBody, clientUA, customCfg)
 		useAPIKey := shouldUseClaudeAPIKey(apiKey, request)
 		isOAuthToken = isClaudeOAuthToken(apiKey)
 		if isOAuthToken {
 			requestBody = applyClaudeToolPrefix(requestBody, claudeToolPrefix)
 		}
 
-		// 2. Set headers (streaming only if requested)
-		applyClaudeHeaders(upstreamReq, request, apiKey, useAPIKey, extraBetas, stream)
+		// 2. Set headers — pick variant based on the effective disguise type
+		// (ResolveDisguise migrates the legacy `cloak` JSON field on the way in).
+		//   bedrock      — strip Claude Code identity entirely (applyBedrockCompatHeaders)
+		//   none         — raw forwarding: copy client headers, override auth only
+		//   claude-code  — inject Claude Code identity headers (legacy default)
+		//   "" / nil     — same as claude-code (backward compatibility)
+		effectiveDisguise := customCfg.ResolveDisguise()
+		disguiseType := ""
+		if effectiveDisguise != nil {
+			disguiseType = strings.ToLower(strings.TrimSpace(effectiveDisguise.Type))
+		}
+		switch disguiseType {
+		case domain.DisguiseTypeBedrock:
+			applyBedrockCompatHeaders(upstreamReq, request, apiKey, stream)
+		case domain.DisguiseTypeNone:
+			// Raw forwarding: copy client headers, then override auth with the
+			// provider's key. This preserves whatever the inbound client sent
+			// without injecting any Claude Code fingerprints.
+			originalHeaders := flow.GetRequestHeaders(c)
+			upstreamReq.Header = make(http.Header)
+			copyHeadersFiltered(upstreamReq.Header, originalHeaders)
+
+			// processClaudeRequestBody always strips body-side `betas` into
+			// extraBetas. The legacy claude-code header path re-merges them
+			// into Anthropic-Beta; raw forwarding mode has to do it here too,
+			// otherwise body beta flags silently disappear before reaching
+			// upstream.
+			if len(extraBetas) > 0 {
+				upstreamReq.Header.Set(
+					"Anthropic-Beta",
+					mergeBetaList(upstreamReq.Header.Get("Anthropic-Beta"), extraBetas),
+				)
+			}
+
+			// We're inside `case domain.ClientTypeClaude:`, so the upstream is
+			// always a Claude-format endpoint regardless of what the inbound
+			// client looked like. setClaudeAuthForURL handles all three concerns
+			// in one call:
+			//
+			//   - clears every stale source credential header
+			//     (Authorization / x-api-key / x-goog-api-key) so a converted
+			//     OpenAI-, Codex- or Gemini-origin request can't leak its source
+			//     auth alongside the provider key
+			//   - writes the URL-appropriate Claude auth (x-api-key for direct
+			//     api.anthropic.com, Authorization: Bearer for every other host)
+			//   - is a no-op when apiKey is empty
+			setClaudeAuthForURL(upstreamReq, apiKey, useAPIKey)
+		default:
+			applyClaudeHeaders(upstreamReq, request, apiKey, useAPIKey, extraBetas, stream)
+		}
 
 		// 3. Update request body and ContentLength (IMPORTANT: body was modified)
 		upstreamReq.Body = io.NopCloser(bytes.NewReader(requestBody))

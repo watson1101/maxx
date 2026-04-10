@@ -1,4 +1,4 @@
-import type { ClientType, Provider } from '@/lib/transport';
+import type { ClientType, DisguiseType, Provider } from '@/lib/transport';
 import { getProviderColorVar } from '@/lib/theme';
 import type { LucideIcon } from 'lucide-react';
 import { Wand2, Zap, Server, Mail, Globe, Code2, Sparkles, Cloud } from 'lucide-react';
@@ -240,6 +240,10 @@ export type ProviderFormData = {
   baseURL: string;
   apiKey: string;
   clients: ClientConfig[];
+  // Disguise: which client identity to present to the upstream relay.
+  // Re-uses the canonical DisguiseType enum from the transport layer so the
+  // form types stay in sync if the protocol enum is extended.
+  disguiseType?: DisguiseType;
   cloakMode?: 'auto' | 'always' | 'never';
   cloakStrictMode?: boolean;
   cloakSensitiveWords?: string;

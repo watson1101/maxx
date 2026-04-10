@@ -22,8 +22,15 @@ type ProviderConfigCustom struct {
 	// API Key
 	APIKey string `json:"apiKey"`
 
-	// Claude Cloaking 配置（可选）
-	Cloak *ProviderConfigCustomCloak `json:"cloak,omitempty"`
+	// 伪装配置（可选）。控制对外发包时把请求装成什么客户端。
+	// 替代旧的 Cloak 字段，互斥地选择一种伪装类型。
+	Disguise *ProviderConfigCustomDisguise `json:"disguise,omitempty"`
+
+	// LegacyCloak 是被 Disguise 取代的旧字段名。仅为了兼容升级前已经写入数据库的
+	// provider 配置而保留——这些配置的 JSON 里依然有 "cloak": {...}。新代码不要直接
+	// 读这个字段，而是通过 ResolveDisguise() 拿到统一形状。第一次 edit-and-save 之后
+	// 会被表单序列化器替换成 Disguise，自然消失。
+	LegacyCloak *DisguiseClaudeCodeOptions `json:"cloak,omitempty"`
 
 	// 某个 Client 有特殊的 BaseURL
 	ClientBaseURL map[ClientType]string `json:"clientBaseURL,omitempty"`
@@ -35,7 +42,30 @@ type ProviderConfigCustom struct {
 	ModelMapping map[string]string `json:"modelMapping,omitempty"`
 }
 
-type ProviderConfigCustomCloak struct {
+// Disguise type constants. Use these instead of magic strings when dispatching
+// on ProviderConfigCustomDisguise.Type so typos and renames are caught at compile time.
+const (
+	// DisguiseTypeNone — 不伪装，按客户端原始 header 透传，仅覆盖鉴权头
+	DisguiseTypeNone = "none"
+	// DisguiseTypeClaudeCode — 装成 Claude Code CLI（注入 system prompt / 伪 user_id / x-stainless 等）
+	DisguiseTypeClaudeCode = "claude-code"
+	// DisguiseTypeBedrock — 洗掉 Claude Code 标识，让后端为 AWS Bedrock 的中转站不报 invalid beta flag
+	DisguiseTypeBedrock = "bedrock"
+)
+
+// ProviderConfigCustomDisguise 描述对外伪装的目标客户端类型与对应子选项。
+// Type 为单选枚举，互斥地决定走哪一种伪装逻辑。空值或 nil 等同于
+// DisguiseTypeClaudeCode（保留旧的 cloak 默认行为）。
+type ProviderConfigCustomDisguise struct {
+	// 必须是 DisguiseType* 常量之一（或空字符串，等同于 claude-code）
+	Type string `json:"type,omitempty"`
+
+	// claude-code 类型的子选项
+	ClaudeCode *DisguiseClaudeCodeOptions `json:"claudeCode,omitempty"`
+}
+
+// DisguiseClaudeCodeOptions 是 Claude Code 伪装的子选项，沿用旧 Cloak 的形状。
+type DisguiseClaudeCodeOptions struct {
 	// "auto" (default), "always", "never"
 	Mode string `json:"mode,omitempty"`
 
@@ -44,6 +74,27 @@ type ProviderConfigCustomCloak struct {
 
 	// 敏感词列表（会做零宽分隔混淆）
 	SensitiveWords []string `json:"sensitiveWords,omitempty"`
+}
+
+// ResolveDisguise 返回该 custom config 的有效伪装配置，自动把旧的 LegacyCloak 字段
+// 迁移到新的 Disguise 形状。优先级：Disguise > LegacyCloak > nil。
+//
+// 用于升级路径：升级前的 provider 配置只有 cloak，升级后第一次加载时通过这个方法
+// 把它当作 Disguise{Type: claude-code, ClaudeCode: <legacy>} 看待，行为与升级前一致。
+func (c *ProviderConfigCustom) ResolveDisguise() *ProviderConfigCustomDisguise {
+	if c == nil {
+		return nil
+	}
+	if c.Disguise != nil {
+		return c.Disguise
+	}
+	if c.LegacyCloak != nil {
+		return &ProviderConfigCustomDisguise{
+			Type:       DisguiseTypeClaudeCode,
+			ClaudeCode: c.LegacyCloak,
+		}
+	}
+	return nil
 }
 
 type ProviderConfigAntigravity struct {

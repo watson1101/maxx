@@ -40,6 +40,7 @@ import type {
   ModelMappingInput,
 } from '@/lib/transport';
 import { defaultClients, type ClientConfig } from '../types';
+import { buildDisguisePayload } from '../utils/disguise';
 import { ClientsConfigSection } from './clients-config-section';
 import { AntigravityProviderView } from './antigravity-provider-view';
 import { BedrockProviderView } from './bedrock-provider-view';
@@ -279,6 +280,7 @@ type EditFormData = {
   apiKey: string;
   clients: ClientConfig[];
   supportModels: string[];
+  disguiseType?: 'none' | 'claude-code' | 'bedrock';
   cloakMode?: 'auto' | 'always' | 'never';
   cloakStrictMode?: boolean;
   cloakSensitiveWords?: string;
@@ -310,16 +312,35 @@ export function ProviderEditFlow({ provider, onClose }: ProviderEditFlowProps) {
   };
 
   const [showApiKey, setShowApiKey] = useState(false);
-  const [formData, setFormData] = useState<EditFormData>({
-    name: provider.name,
-    baseURL: provider.config?.custom?.baseURL || '',
-    apiKey: provider.config?.custom?.apiKey || '',
-    clients: initClients(),
-    supportModels: provider.supportModels || [],
-    cloakMode: provider.config?.custom?.cloak?.mode || 'auto',
-    cloakStrictMode: provider.config?.custom?.cloak?.strictMode || false,
-    cloakSensitiveWords: (provider.config?.custom?.cloak?.sensitiveWords || []).join('\n'),
-    disableErrorCooldown: provider.config?.disableErrorCooldown ?? false,
+  const [formData, setFormData] = useState<EditFormData>(() => {
+    // Read effective claude-code sub-options, preferring the new `disguise`
+    // shape but falling back to the legacy `cloak` field so providers saved
+    // before the migration continue to display their previous settings.
+    const customCfg = provider.config?.custom as
+      | (NonNullable<typeof provider.config>['custom'] & {
+          cloak?: { mode?: 'auto' | 'always' | 'never'; strictMode?: boolean; sensitiveWords?: string[] };
+        })
+      | undefined;
+    const disguise = customCfg?.disguise;
+    const legacyCloak = customCfg?.cloak;
+    // Default disguiseType: 'claude-code' (preserves legacy auto-cloak behavior).
+    const disguiseType = (disguise?.type ?? 'claude-code') as
+      | 'none'
+      | 'claude-code'
+      | 'bedrock';
+    const cc = disguise?.claudeCode ?? legacyCloak;
+    return {
+      name: provider.name,
+      baseURL: provider.config?.custom?.baseURL || '',
+      apiKey: provider.config?.custom?.apiKey || '',
+      clients: initClients(),
+      supportModels: provider.supportModels || [],
+      disguiseType,
+      cloakMode: cc?.mode || 'auto',
+      cloakStrictMode: cc?.strictMode || false,
+      cloakSensitiveWords: (cc?.sensitiveWords || []).join('\n'),
+      disableErrorCooldown: provider.config?.disableErrorCooldown ?? false,
+    };
   });
 
   const updateClient = (clientId: ClientType, updates: Partial<ClientConfig>) => {
@@ -337,12 +358,16 @@ export function ProviderEditFlow({ provider, onClose }: ProviderEditFlowProps) {
     return hasEnabledClient && hasUrl;
   };
 
-  const parseSensitiveWords = (value: string): string[] => {
-    return value
-      .split(/[\n,]/)
-      .map((item) => item.trim())
-      .filter(Boolean);
-  };
+  // Build the disguise payload from current form state. Delegates to the
+  // shared util in ../utils/disguise so the create flow and the edit flow
+  // produce identical payloads.
+  const currentDisguisePayload = () =>
+    buildDisguisePayload(
+      formData.disguiseType,
+      formData.cloakMode,
+      !!formData.cloakStrictMode,
+      formData.cloakSensitiveWords || '',
+    );
 
   const handleSave = async () => {
     if (!isValid()) return;
@@ -374,16 +399,7 @@ export function ProviderEditFlow({ provider, onClose }: ProviderEditFlowProps) {
             clientBaseURL: Object.keys(clientBaseURL).length > 0 ? clientBaseURL : undefined,
             clientMultiplier:
               Object.keys(clientMultiplier).length > 0 ? clientMultiplier : undefined,
-            cloak:
-              formData.cloakMode !== 'auto' ||
-              formData.cloakStrictMode ||
-              parseSensitiveWords(formData.cloakSensitiveWords || '').length > 0
-                ? {
-                    mode: formData.cloakMode,
-                    strictMode: formData.cloakStrictMode,
-                    sensitiveWords: parseSensitiveWords(formData.cloakSensitiveWords || ''),
-                  }
-                : undefined,
+            disguise: currentDisguisePayload(),
           },
         },
         supportedClientTypes,
@@ -436,16 +452,7 @@ export function ProviderEditFlow({ provider, onClose }: ProviderEditFlowProps) {
             clientBaseURL: Object.keys(clientBaseURL).length > 0 ? clientBaseURL : undefined,
             clientMultiplier:
               Object.keys(clientMultiplier).length > 0 ? clientMultiplier : undefined,
-            cloak:
-              formData.cloakMode !== 'auto' ||
-              formData.cloakStrictMode ||
-              parseSensitiveWords(formData.cloakSensitiveWords || '').length > 0
-                ? {
-                    mode: formData.cloakMode,
-                    strictMode: formData.cloakStrictMode,
-                    sensitiveWords: parseSensitiveWords(formData.cloakSensitiveWords || ''),
-                  }
-                : undefined,
+            disguise: currentDisguisePayload(),
           },
         },
         supportedClientTypes,
@@ -723,17 +730,20 @@ export function ProviderEditFlow({ provider, onClose }: ProviderEditFlowProps) {
             <ClientsConfigSection
               clients={formData.clients}
               onUpdateClient={updateClient}
-              cloak={{
-                mode: formData.cloakMode || 'auto',
-                strictMode: !!formData.cloakStrictMode,
-                sensitiveWords: formData.cloakSensitiveWords || '',
+              disguise={{
+                type: formData.disguiseType ?? 'claude-code',
+                claudeCodeMode: formData.cloakMode ?? 'auto',
+                claudeCodeStrictMode: !!formData.cloakStrictMode,
+                claudeCodeSensitiveWords: formData.cloakSensitiveWords ?? '',
               }}
-              onUpdateCloak={(updates) =>
+              onUpdateDisguise={(updates) =>
                 setFormData((prev) => ({
                   ...prev,
-                  cloakMode: updates?.mode ?? prev.cloakMode,
-                  cloakStrictMode: updates?.strictMode ?? prev.cloakStrictMode,
-                  cloakSensitiveWords: updates?.sensitiveWords ?? prev.cloakSensitiveWords,
+                  disguiseType: updates?.type ?? prev.disguiseType,
+                  cloakMode: updates?.claudeCodeMode ?? prev.cloakMode,
+                  cloakStrictMode: updates?.claudeCodeStrictMode ?? prev.cloakStrictMode,
+                  cloakSensitiveWords:
+                    updates?.claudeCodeSensitiveWords ?? prev.cloakSensitiveWords,
                 }))
               }
             />

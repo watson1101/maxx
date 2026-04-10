@@ -11,6 +11,7 @@ import { ModelInput } from '@/components/ui/model-input';
 import { PageHeader } from '@/components/layout/page-header';
 import { useProviderForm } from '../context/provider-form-context';
 import { useProviderNavigation } from '../hooks/use-provider-navigation';
+import { buildDisguisePayload } from '../utils/disguise';
 
 export function CustomConfigStep() {
   const [showApiKey, setShowApiKey] = useState(false);
@@ -28,13 +29,6 @@ export function CustomConfigStep() {
   const { goToSelectType, goToProviders } = useProviderNavigation();
   const createProvider = useCreateProvider();
   const createModelMapping = useCreateModelMapping();
-
-  const parseSensitiveWords = (value: string): string[] => {
-    return value
-      .split(/[\n,]/)
-      .map((item) => item.trim())
-      .filter(Boolean);
-  };
 
   const handleSave = async () => {
     if (!isValid()) return;
@@ -55,6 +49,13 @@ export function CustomConfigStep() {
         }
       });
 
+      const disguise = buildDisguisePayload(
+        formData.disguiseType,
+        formData.cloakMode,
+        !!formData.cloakStrictMode,
+        formData.cloakSensitiveWords || '',
+      );
+
       const data: CreateProviderData = {
         type: 'custom',
         name: formData.name,
@@ -67,16 +68,7 @@ export function CustomConfigStep() {
             clientBaseURL: Object.keys(clientBaseURL).length > 0 ? clientBaseURL : undefined,
             clientMultiplier:
               Object.keys(clientMultiplier).length > 0 ? clientMultiplier : undefined,
-            cloak:
-              formData.cloakMode !== 'auto' ||
-              formData.cloakStrictMode ||
-              parseSensitiveWords(formData.cloakSensitiveWords || '').length > 0
-                ? {
-                    mode: formData.cloakMode,
-                    strictMode: formData.cloakStrictMode,
-                    sensitiveWords: parseSensitiveWords(formData.cloakSensitiveWords || ''),
-                  }
-                : undefined,
+            disguise,
           },
         },
         supportedClientTypes,
@@ -206,16 +198,19 @@ export function CustomConfigStep() {
             <ClientsConfigSection
               clients={formData.clients}
               onUpdateClient={updateClient}
-              cloak={{
-                mode: formData.cloakMode || 'auto',
-                strictMode: !!formData.cloakStrictMode,
-                sensitiveWords: formData.cloakSensitiveWords || '',
+              disguise={{
+                type: formData.disguiseType ?? 'claude-code',
+                claudeCodeMode: formData.cloakMode ?? 'auto',
+                claudeCodeStrictMode: !!formData.cloakStrictMode,
+                claudeCodeSensitiveWords: formData.cloakSensitiveWords ?? '',
               }}
-              onUpdateCloak={(updates) =>
+              onUpdateDisguise={(updates) =>
                 updateFormData({
-                  cloakMode: updates?.mode ?? formData.cloakMode,
-                  cloakStrictMode: updates?.strictMode ?? formData.cloakStrictMode,
-                  cloakSensitiveWords: updates?.sensitiveWords ?? formData.cloakSensitiveWords,
+                  disguiseType: updates?.type ?? formData.disguiseType,
+                  cloakMode: updates?.claudeCodeMode ?? formData.cloakMode,
+                  cloakStrictMode: updates?.claudeCodeStrictMode ?? formData.cloakStrictMode,
+                  cloakSensitiveWords:
+                    updates?.claudeCodeSensitiveWords ?? formData.cloakSensitiveWords,
                 })
               }
             />
