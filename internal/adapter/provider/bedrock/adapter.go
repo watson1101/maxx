@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -30,6 +32,7 @@ type BedrockAdapter struct {
 	provider   *domain.Provider
 	httpClient *http.Client
 	creds      credentials.StaticCredentialsProvider
+	discoverer *profileDiscoverer
 }
 
 func NewAdapter(p *domain.Provider) (provider.ProviderAdapter, error) {
@@ -37,15 +40,83 @@ func NewAdapter(p *domain.Provider) (provider.ProviderAdapter, error) {
 		return nil, fmt.Errorf("provider %s missing bedrock config", p.Name)
 	}
 	config := p.Config.Bedrock
+	creds := credentials.NewStaticCredentialsProvider(config.AccessKeyID, config.SecretAccessKey, "")
+	region := config.Region
+	if region == "" {
+		region = DefaultRegion
+	}
+	httpClient := newHTTPClient()
 	return &BedrockAdapter{
 		provider:   p,
-		httpClient: newHTTPClient(),
-		creds:      credentials.NewStaticCredentialsProvider(config.AccessKeyID, config.SecretAccessKey, ""),
+		httpClient: httpClient,
+		creds:      creds,
+		discoverer: newProfileDiscoverer(httpClient, creds, region),
 	}, nil
 }
 
 func (a *BedrockAdapter) SupportedClientTypes() []domain.ClientType {
 	return []domain.ClientType{domain.ClientTypeClaude}
+}
+
+// DiscoveredModel describes one entry in the discovery catalog: the
+// client-facing short name, the invoke-ready Bedrock ID, and which
+// upstream catalog it came from. Source is either "inference-profile"
+// (cross-region, ID carries a region prefix) or "foundation-model"
+// (bare anthropic.X, single-region).
+type DiscoveredModel struct {
+	ShortName string `json:"shortName"`
+	BedrockID string `json:"bedrockId"`
+	Source    string `json:"source"`
+}
+
+// DiscoveredModelsResult is the payload returned by the admin endpoint.
+// Available distinguishes "discovery completed, the listed models are
+// what this provider can currently invoke" from "discovery never
+// succeeded — usually missing bedrock:ListInferenceProfiles IAM
+// permission"; Region echoes back where the lookup ran so the UI can
+// show it alongside the list.
+type DiscoveredModelsResult struct {
+	Available bool              `json:"available"`
+	Region    string            `json:"region"`
+	Models    []DiscoveredModel `json:"models"`
+}
+
+// DiscoveredModels triggers a discovery refresh (subject to the normal
+// TTL) and returns the current catalog. Uses an isolated background
+// context so admin UI polling can't poison the shared cache.
+func (a *BedrockAdapter) DiscoveredModels(ctx context.Context) DiscoveredModelsResult {
+	region := DefaultRegion
+	if a.provider != nil && a.provider.Config != nil && a.provider.Config.Bedrock != nil && a.provider.Config.Bedrock.Region != "" {
+		region = a.provider.Config.Bedrock.Region
+	}
+	result := DiscoveredModelsResult{Region: region}
+	if a.discoverer == nil {
+		return result
+	}
+
+	lookupCtx, cancel := context.WithTimeout(ctx, discoveryLookupTimeout)
+	defer cancel()
+	// Force a refresh if the cache is stale. Lookup's argument is a
+	// miss-on-purpose key — we only want the side effect.
+	_, _ = a.discoverer.Lookup(lookupCtx, "__admin_refresh__")
+
+	entries := a.discoverer.Entries()
+	result.Available = a.discoverer.Available()
+	result.Models = make([]DiscoveredModel, 0, len(entries))
+	for _, e := range entries {
+		// Source is carried from the AWS catalog that produced the
+		// entry, not inferred from the ID shape — profile-shaped IDs
+		// can appear unprefixed from ListFoundationModels too.
+		result.Models = append(result.Models, DiscoveredModel{
+			ShortName: e.ShortName,
+			BedrockID: e.BedrockID,
+			Source:    e.Source,
+		})
+	}
+	sort.Slice(result.Models, func(i, j int) bool {
+		return result.Models[i].ShortName < result.Models[j].ShortName
+	})
+	return result
 }
 
 func (a *BedrockAdapter) Execute(c *flow.Ctx, provider *domain.Provider) error {
@@ -79,7 +150,21 @@ func (a *BedrockAdapter) Execute(c *flow.Ctx, provider *domain.Provider) error {
 	if mappedModel == "" {
 		mappedModel = flow.GetRequestModel(c)
 	}
-	bedrockModelID := resolveModelID(mappedModel, config.ModelMapping, modelPrefix)
+	lookup := func(name string) (string, bool) {
+		if a.discoverer == nil {
+			return "", false
+		}
+		// Decouple discovery from the request context: a client disconnect
+		// must not cancel an in-flight ListInferenceProfiles call and poison
+		// the shared cache. Give discovery its own bounded timeout.
+		discoveryCtx, cancel := context.WithTimeout(context.Background(), discoveryLookupTimeout)
+		defer cancel()
+		return a.discoverer.Lookup(discoveryCtx, name)
+	}
+	bedrockModelID, ok := resolveModelID(mappedModel, config.ModelMapping, modelPrefix, lookup)
+	if !ok {
+		return a.unresolvableModelError(mappedModel, region)
+	}
 
 	// Sanitize request body for Bedrock
 	requestBody = sanitizeRequestBody(requestBody)
@@ -143,7 +228,14 @@ func (a *BedrockAdapter) Execute(c *flow.Ctx, provider *domain.Provider) error {
 			})
 		}
 
-		return classifyBedrockHTTPError(resp.StatusCode, body, resp.Header, mappedModel)
+		proxyErr := classifyBedrockHTTPError(resp.StatusCode, body, resp.Header, mappedModel)
+		// When the upstream rejects our model ID, AWS may have rotated legacy
+		// profiles. Invalidate the discovery cache so the *next* request
+		// reloads from ListInferenceProfiles and picks up the new mapping.
+		if a.discoverer != nil && proxyErr != nil && proxyErr.Reason == domain.CooldownReasonModelUnavailable {
+			a.discoverer.Invalidate()
+		}
+		return proxyErr
 	}
 
 	// Handle response
@@ -355,6 +447,30 @@ func sendFinalStreamEvents(eventChan domain.AdapterEventChan, collector *usage.S
 	if *model != "" {
 		eventChan.SendResponseModel(*model)
 	}
+}
+
+// unresolvableModelError builds a ScopeModel error when the request model
+// cannot be resolved to a Bedrock ID. The message differs depending on
+// whether discovery is usable, so the operator knows whether to grant IAM
+// permission or just add a modelMapping entry.
+func (a *BedrockAdapter) unresolvableModelError(model, region string) *domain.ProxyError {
+	var msg string
+	if a.discoverer != nil && a.discoverer.Available() {
+		names := a.discoverer.Names()
+		sort.Strings(names)
+		msg = fmt.Sprintf("model %q is not available on Bedrock in region %s; available: [%s]",
+			model, region, strings.Join(names, ", "))
+	} else {
+		msg = fmt.Sprintf("cannot resolve model %q: Bedrock discovery unavailable "+
+			"(grant bedrock:ListInferenceProfiles or configure bedrock.modelMapping)", model)
+	}
+	proxyErr := domain.NewProxyErrorWithMessage(errors.New(msg), false, msg)
+	proxyErr.Scope = domain.ScopeModel
+	proxyErr.Reason = domain.CooldownReasonModelUnavailable
+	proxyErr.Model = model
+	proxyErr.ClientType = string(domain.ClientTypeClaude)
+	proxyErr.HTTPStatusCode = http.StatusBadRequest
+	return proxyErr
 }
 
 func classifyBedrockHTTPError(statusCode int, body []byte, headers http.Header, model string) *domain.ProxyError {
