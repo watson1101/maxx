@@ -10,36 +10,40 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/awsl-project/maxx/internal/domain"
+	"github.com/awsl-project/maxx/internal/repository"
 )
 
-// profileIDPattern extracts the Anthropic short name + date from a Bedrock
-// inference profile ID. Supported shapes:
+// bedrockAnthropicPattern matches any Anthropic Bedrock ID — inference
+// profile or foundation model, region-prefixed or bare, dated or dateless,
+// with or without a version suffix. Observed shapes in us-east-1 as of
+// 2026-04 (via `listAll` against ListInferenceProfiles + ListFoundationModels):
 //
-//	us.anthropic.claude-opus-4-7-20260115-v1:0
+//	us.anthropic.claude-opus-4-7                        // new bare
+//	global.anthropic.claude-opus-4-7
+//	us.anthropic.claude-opus-4-6-v1                     // bare + -v suffix
+//	us.anthropic.claude-sonnet-4-6                      // bare
+//	us.anthropic.claude-opus-4-5-20251101-v1:0          // classic dated + versioned
 //	anthropic.claude-3-5-sonnet-20241022-v2:0
-//	eu.anthropic.claude-sonnet-4-5-20250514-v1:0
+//	eu.anthropic.claude-sonnet-4-5-20250929-v1:0
+//	anthropic.claude-sonnet-4-6                         // FM bare
+//	anthropic.claude-v2                                 // legacy, no date
 //
-// Capture groups: 1=short name (e.g. "claude-opus-4-7"), 2=date (YYYYMMDD).
-var profileIDPattern = regexp.MustCompile(
-	`^(?:[a-z]{2,}\.)?anthropic\.(claude-[a-z0-9-]+?)-(\d{8})-v\d+:\d+$`,
-)
-
-// foundationModelPattern extracts the short name from a Bedrock foundation-
-// model ID that has no release date (newer AWS releases frequently omit
-// it). Shapes:
+// Capture groups:
+//   1 = short name (e.g. "claude-opus-4-7")
+//   2 = date (YYYYMMDD) or empty
 //
-//	anthropic.claude-sonnet-4-6
-//	anthropic.claude-opus-4-6-v1
-//
-// The capture requires at least one digit to reject ancient legacy IDs
-// like "anthropic.claude-v2" that would otherwise collapse to "claude".
-var foundationModelPattern = regexp.MustCompile(
-	`^anthropic\.(claude-[a-z0-9-]*?\d[a-z0-9-]*?)(?:-v\d+)?$`,
+// The capture's \d requirement prevents collapsing legacy "claude" (no
+// version digits) into an empty short name, and keeps non-Anthropic IDs
+// out of the match entirely.
+var bedrockAnthropicPattern = regexp.MustCompile(
+	`^(?:[a-z]{2,}\.)?anthropic\.(claude-[a-z0-9-]*?\d[a-z0-9-]*?)(?:-(\d{8}))?(?:-v\d+(?::\d+)?)?$`,
 )
 
 // defaultDiscoveryTTL is how long a successful discovery result is cached.
@@ -101,6 +105,16 @@ type profileDiscoverer struct {
 	region     string
 	ttl        time.Duration
 
+	// repo persists this provider's catalog across restarts. nil means
+	// persistence is disabled (unit tests, or before main wires it up) —
+	// discovery falls back to in-memory-only behaviour.
+	repo       repository.BedrockDiscoveryRepository
+	providerID uint64
+	// accessKeyID is the AWS access-key identifier used to fingerprint
+	// stored rows so a config edit to different creds invalidates the
+	// cache. Non-secret by definition (the "AKIA…" half of a key pair).
+	accessKeyID string
+
 	mu          sync.Mutex
 	entries     map[string]discoveredEntry
 	expiresAt   time.Time
@@ -118,6 +132,76 @@ func newProfileDiscoverer(httpClient *http.Client, creds credentials.StaticCrede
 		ttl:        defaultDiscoveryTTL,
 		entries:    map[string]discoveredEntry{},
 	}
+}
+
+// loadFromStore seeds the in-memory cache from persistent storage.
+// Called once at adapter construction. Rehydrated entries are treated
+// as "already loaded" so Available() returns true immediately and the
+// UI doesn't show an empty list during the first request. The TTL
+// clock is re-anchored to the persisted fetchedAt — an hour-old cache
+// will trigger a refresh on the next Lookup, a 2-minute-old one won't.
+// Failures are logged and ignored: a dead store must not prevent
+// discovery from working, it just means the first request eats the
+// cold-start latency.
+func (d *profileDiscoverer) loadFromStore() {
+	if d.repo == nil {
+		return
+	}
+	rows, fetchedAt, err := d.repo.Load(d.providerID, d.region, d.accessKeyID)
+	if err != nil {
+		log.Printf("bedrock discovery: load from store failed (%v); continuing with cold cache", err)
+		return
+	}
+	if len(rows) == 0 {
+		return
+	}
+	entries := make(map[string]discoveredEntry, len(rows)*2)
+	for _, r := range rows {
+		var src entrySource
+		if r.Source == "inference-profile" {
+			src = sourceInferenceProfile
+		} else {
+			src = sourceFoundation
+		}
+		entry := discoveredEntry{id: r.BedrockID, source: src}
+		entries[r.ShortName] = entry
+		// Rebuild the dated-name alias from the Bedrock ID so clients
+		// that send explicit release-dated names (e.g.
+		// "claude-3-5-sonnet-20241022") keep resolving to the correct
+		// versioned profile ID after a restart. Without this, a cold
+		// discoverer misses on the dated lookup and resolveModelID
+		// synthesises "anthropic.claude-3-5-sonnet-20241022-v1:0"
+		// which hits a different model (the real profile is -v2:0).
+		if _, date, ok := extractNameAndDate(r.BedrockID); ok && date != "" {
+			entries[r.ShortName+"-"+date] = entry
+		}
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.entries = entries
+	d.lastFetchAt = fetchedAt
+	d.expiresAt = fetchedAt.Add(d.ttl)
+	d.everLoaded = true
+}
+
+// snapshotPersistableRows collects the short-name entries worth
+// persisting from the current catalog. Runs while d.mu is held so the
+// caller can release the lock before doing the blocking DB write.
+// Dated-name aliases are skipped — loadFromStore reconstructs them from
+// the stored Bedrock ID.
+func (d *profileDiscoverer) snapshotPersistableRows() []*domain.BedrockDiscoveryEntry {
+	rows := make([]*domain.BedrockDiscoveryEntry, 0, len(d.entries))
+	for k, v := range d.entries {
+		if modelDatePattern.MatchString(k) {
+			continue
+		}
+		rows = append(rows, &domain.BedrockDiscoveryEntry{
+			ShortName: k,
+			BedrockID: v.id,
+			Source:    v.source.label(),
+		})
+	}
+	return rows
 }
 
 // Lookup returns the discovered Bedrock profile ID for an Anthropic short name
@@ -199,6 +283,21 @@ func (s entrySource) label() string {
 	return "foundation-model"
 }
 
+// ForceRefresh clears the cache expiry and performs a synchronous
+// refresh, bypassing the Invalidate() rate-limit. Used by the admin
+// "refresh" endpoint where the operator's intent is explicit and a
+// stampede is not possible (one user, one click). Returns the most
+// recent fetch error if the refresh failed, nil otherwise.
+func (d *profileDiscoverer) ForceRefresh(ctx context.Context) error {
+	d.mu.Lock()
+	d.expiresAt = time.Time{}
+	d.mu.Unlock()
+	d.ensureFresh(ctx)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.lastErr
+}
+
 // Invalidate marks the cache as stale so the next Lookup forces a refresh.
 // Rate-limited: if the most recent fetch completed less than
 // minInvalidateInterval ago, the call is a no-op. This protects against a
@@ -241,15 +340,25 @@ func (d *profileDiscoverer) ensureFresh(ctx context.Context) {
 	d.loadingCh = nil
 	close(ch)
 	now := time.Now()
+	// Snapshot rows to persist *inside* the lock, but perform the
+	// blocking DB write outside — SQLite's transaction can stall on
+	// contention and holding d.mu would serialise every concurrent
+	// Lookup behind it.
+	var toPersist []*domain.BedrockDiscoveryEntry
+	var shouldPersist bool
 	switch {
 	case err == nil:
 		d.lastErr = nil
 		if entries != nil {
 			d.entries = entries
+			shouldPersist = true
 		}
 		d.expiresAt = now.Add(d.ttl)
 		d.lastFetchAt = now
 		d.everLoaded = true
+		if shouldPersist {
+			toPersist = d.snapshotPersistableRows()
+		}
 	case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
 		// Transient cancellation from a caller-supplied context — do not
 		// poison the cache with a failure TTL, the next caller should retry
@@ -261,6 +370,12 @@ func (d *profileDiscoverer) ensureFresh(ctx context.Context) {
 		d.lastFetchAt = now
 	}
 	d.mu.Unlock()
+
+	if shouldPersist && d.repo != nil {
+		if err := d.repo.Replace(d.providerID, d.region, d.accessKeyID, toPersist, now); err != nil {
+			log.Printf("bedrock discovery: save to store failed (%v)", err)
+		}
+	}
 }
 
 // fetch builds the Anthropic short-name → Bedrock-ID map for the configured
@@ -314,9 +429,14 @@ func (d *profileDiscoverer) fetchInferenceProfiles(ctx context.Context) (map[str
 	var nextToken string
 	base := fmt.Sprintf("https://bedrock.%s.amazonaws.com/inference-profiles", d.region)
 
+	// NOTE: intentionally no `typeEquals` filter. AWS surfaces newly-
+	// entitled cross-region profiles (e.g. us.anthropic.claude-opus-4-7
+	// once the account has access) under type=APPLICATION, not
+	// SYSTEM_DEFINED. Filtering to SYSTEM_DEFINED hides them from
+	// discovery entirely; the unfiltered query returns the union and
+	// upsertEntry's newer-wins rule deduplicates any overlap.
 	for {
 		q := url.Values{}
-		q.Set("typeEquals", "SYSTEM_DEFINED")
 		q.Set("maxResults", "100")
 		if nextToken != "" {
 			q.Set("nextToken", nextToken)
@@ -380,7 +500,8 @@ func (d *profileDiscoverer) fetchFoundationModels(ctx context.Context) (map[stri
 
 	var parsed struct {
 		ModelSummaries []struct {
-			ModelID        string `json:"modelId"`
+			ModelID                  string   `json:"modelId"`
+			InferenceTypesSupported  []string `json:"inferenceTypesSupported"`
 			ModelLifecycle struct {
 				Status string `json:"status"`
 			} `json:"modelLifecycle"`
@@ -394,6 +515,17 @@ func (d *profileDiscoverer) fetchFoundationModels(ctx context.Context) (map[stri
 		if s.ModelLifecycle.Status != "" && s.ModelLifecycle.Status != "ACTIVE" {
 			continue
 		}
+		// Skip foundation models that AWS will not serve on-demand.
+		// Claude 4.x currently ships as FM-only entries whose
+		// inferenceTypesSupported is ["INFERENCE_PROFILE"] — invoking
+		// them directly yields "on-demand throughput isn't supported",
+		// and there is no way for this adapter to invoke a foundation
+		// model through a profile it cannot discover. Missing/empty
+		// field is treated as on-demand-capable (older catalog shapes
+		// and unit-test fixtures that don't set it).
+		if len(s.InferenceTypesSupported) > 0 && !slices.Contains(s.InferenceTypesSupported, "ON_DEMAND") {
+			continue
+		}
 		short, date, ok := extractNameAndDate(s.ModelID)
 		if !ok {
 			continue
@@ -405,6 +537,7 @@ func (d *profileDiscoverer) fetchFoundationModels(ctx context.Context) (map[stri
 	}
 	return entries, nil
 }
+
 
 // signedGet issues a SigV4-signed GET and returns the body. Non-2xx becomes
 // an error containing a truncated body so failures stay debuggable without
@@ -452,11 +585,8 @@ func upsertEntry(m map[string]string, key, id string) {
 // shape isn't recognised (non-Anthropic, malformed, or an ancient legacy
 // name without any version digits).
 func extractNameAndDate(modelID string) (short, date string, ok bool) {
-	if m := profileIDPattern.FindStringSubmatch(modelID); len(m) >= 3 {
+	if m := bedrockAnthropicPattern.FindStringSubmatch(modelID); len(m) >= 3 {
 		return m[1], m[2], true
-	}
-	if m := foundationModelPattern.FindStringSubmatch(modelID); len(m) >= 2 {
-		return m[1], "", true
 	}
 	return "", "", false
 }

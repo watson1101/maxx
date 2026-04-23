@@ -252,7 +252,10 @@ func (h *AdminHandler) handleProviders(w http.ResponseWriter, r *http.Request, i
 // table. Available=false means discovery hasn't succeeded (typically
 // missing bedrock:ListInferenceProfiles IAM permission).
 func (h *AdminHandler) handleBedrockDiscoveredModels(w http.ResponseWriter, r *http.Request, id uint64) {
-	if r.Method != http.MethodGet {
+	// GET returns the current catalog (triggers a lazy refresh on TTL
+	// expiry). POST forces an immediate fetch bypassing the TTL and the
+	// Invalidate() rate-limit — used by the admin UI's refresh button.
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
@@ -274,6 +277,24 @@ func (h *AdminHandler) handleBedrockDiscoveredModels(w http.ResponseWriter, r *h
 	bedrockA, ok := adapter.(*bedrock.BedrockAdapter)
 	if !ok {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "bedrock adapter type mismatch"})
+		return
+	}
+	if r.Method == http.MethodPost {
+		// POST always returns the same shape — available/region/models
+		// plus refreshError (empty string on success). Keeping the key
+		// present regardless of outcome means the UI doesn't have to
+		// branch on its existence.
+		result, refreshErr := bedrockA.RefreshDiscoveredModels(r.Context())
+		errStr := ""
+		if refreshErr != nil {
+			errStr = refreshErr.Error()
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"available":    result.Available,
+			"region":       result.Region,
+			"models":       result.Models,
+			"refreshError": errStr,
+		})
 		return
 	}
 	writeJSON(w, http.StatusOK, bedrockA.DiscoveredModels(r.Context()))
