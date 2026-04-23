@@ -470,6 +470,11 @@ func (e *Executor) shouldClearRequestDetail() bool {
 	return e.getRequestDetailRetentionSeconds() == 0
 }
 
+// ShouldClearRequestDetailByConfig 检查是否应该按全局配置立即清理请求详情
+func (e *Executor) ShouldClearRequestDetailByConfig() bool {
+	return e.shouldClearRequestDetail()
+}
+
 // getProviderMultiplier 获取 Provider 针对特定 ClientType 的倍率
 // 返回 10000 表示 1 倍，15000 表示 1.5 倍
 func getProviderMultiplier(provider *domain.Provider, clientType domain.ClientType) uint64 {
