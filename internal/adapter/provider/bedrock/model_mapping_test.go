@@ -148,6 +148,62 @@ func TestResolveModelIDPriority(t *testing.T) {
 			wantOK: true,
 		},
 		{
+			// Client sends "anthropic.<short>" for a model that Bedrock
+			// refuses on-demand (no foundation SKU — must invoke via an
+			// inference profile). Discovery knows the profile under the
+			// short name, so stripping "anthropic." and consulting
+			// discovery lets us resolve to an invoke-ready profile ID
+			// instead of letting the bare foundation ID hit Bedrock and
+			// fail with "on-demand throughput isn't supported".
+			name:   "client-supplied bare anthropic.X resolves via discovery",
+			model:  "anthropic.claude-sonnet-4-9",
+			lookup: discovered,
+			prefix: "us",
+			wantID: "us.anthropic.claude-sonnet-4-9-20260201-v1:0",
+			wantOK: true,
+		},
+		{
+			// Discovery-miss on the stripped short name must fall back to
+			// the original passthrough, not synthesize a profile ID.
+			name:   "client-supplied bare anthropic.X with discovery miss falls back to passthrough",
+			model:  "anthropic.claude-unreleased-99",
+			lookup: discovered,
+			prefix: "us",
+			wantID: "anthropic.claude-unreleased-99",
+			wantOK: true,
+		},
+		{
+			// Foundation-only release: client sends "anthropic.<short>"
+			// and discovery returns a bare foundation ID (no region
+			// prefix). The invoke-ready value from discovery must be
+			// returned verbatim — applyPrefix must not be re-applied on
+			// top of it, since region-prefixing a foundation model ID
+			// makes it invalid.
+			name:   "client-supplied bare anthropic.X with foundation-only discovery hit returns verbatim",
+			model:  "anthropic.claude-sonnet-4-6",
+			lookup: discovered,
+			prefix: "us",
+			wantID: "anthropic.claude-sonnet-4-6",
+			wantOK: true,
+		},
+		{
+			// Degenerate input "anthropic." (empty short after strip)
+			// must not query discovery — an empty-string lookup key is
+			// meaningless and a future discoverer change could surprise.
+			// Falls through to the existing passthrough contract.
+			name:   "degenerate anthropic. passes through without querying discovery",
+			model:  "anthropic.",
+			lookup: func(name string) (string, bool) {
+				if name == "" {
+					t.Fatalf("discovery must not be called with empty key")
+				}
+				return "", false
+			},
+			prefix: "us",
+			wantID: "anthropic.",
+			wantOK: true,
+		},
+		{
 			name:   "client-supplied fully-qualified bedrock ID passes through",
 			model:  "anthropic.claude-opus-4-5-20251101-v1:0",
 			lookup: discovered,
