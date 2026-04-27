@@ -121,10 +121,12 @@ func main() {
 	inviteCodeRepo := sqlite.NewInviteCodeRepository(db)
 	inviteCodeUsageRepo := sqlite.NewInviteCodeUsageRepository(db)
 
-	// Wire Bedrock discovery persistence: each BedrockAdapter will rehydrate
-	// its short-name → inference-profile catalog from SQLite at startup,
-	// avoiding the ~1-5s ListInferenceProfiles round-trip on the first
-	// request after a restart.
+	// Wire Bedrock discovery persistence. The CLI entry point does not
+	// go through core.InitializeServerComponents (the desktop launcher
+	// does — the desktop path gets the same call from core/database.go),
+	// so it needs its own setter call; otherwise the server process
+	// leaves the repo unset and the first Bedrock request after every
+	// restart pays the full AWS discovery round-trip.
 	bedrock.SetDiscoveryRepository(sqlite.NewBedrockDiscoveryRepository(db))
 
 	// Initialize cooldown manager with database persistence
