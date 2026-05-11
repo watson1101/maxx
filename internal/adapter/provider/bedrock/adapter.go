@@ -234,16 +234,19 @@ func (a *BedrockAdapter) Execute(c *flow.Ctx, provider *domain.Provider) error {
 	// on the resolved Bedrock ID's short name, so classic-shape clients
 	// (e.g. Claude Code CLI) can still hit adaptive-only models.
 	if short, _, ok := extractNameAndDate(bedrockModelID); ok {
-		requestBody = adaptThinkingForModel(requestBody, short)
+		requestBody = AdaptThinkingForModel(requestBody, short)
 	}
 
 	// Build upstream URL
 	upstreamURL := buildBedrockURL(region, bedrockModelID, clientWantsStream)
 
-	// Up to two attempts: a Bedrock 400 that rejects a thinking-block
+	// Up to three attempts: two independent retry paths each fire at
+	// most once. (1) a Bedrock 400 that rejects a thinking-block
 	// envelope (signature on `thinking`, opaque `data` on
 	// `redacted_thinking`) is recoverable by stripping those blocks
-	// and replaying once. Cross-deployment replays produced by
+	// and replaying once. (2) a 400 rejecting temperature/top_p/top_k
+	// (extended-thinking mode) is recoverable by stripping those
+	// fields and replaying once. Cross-deployment replays produced by
 	// clients that captured a transcript against Anthropic and now
 	// hit Bedrock are the common cause; retry preserves the rest of
 	// the conversation rather than failing the whole request.
@@ -255,6 +258,7 @@ func (a *BedrockAdapter) Execute(c *flow.Ctx, provider *domain.Provider) error {
 	// not handleStreamResponse.
 	var resp *http.Response
 	thinkingRetried := false
+	samplingRetried := false
 	for {
 		var attemptErr error
 		resp, attemptErr = a.sendBedrockRequest(ctx, c, upstreamURL, requestBody, region, clientWantsStream)
@@ -281,6 +285,20 @@ func (a *BedrockAdapter) Execute(c *flow.Ctx, provider *domain.Provider) error {
 				// schema, which is out of scope for this change.
 				requestBody = stripped
 				thinkingRetried = true
+				continue
+			}
+		}
+
+		// Bedrock sometimes rejects temperature/top_p/top_k for models that
+		// are (always-on) thinking-mode beyond the static list in
+		// thinking_policy.go. Strip and retry once so we don't need to know
+		// every adaptive-only SKU up front. Same single-attempt-slot caveat
+		// as the thinking-envelope retry above.
+		if !samplingRetried && resp.StatusCode == 400 && IsSamplingParamRejectedError(body) {
+			stripped := StripSamplingParams(requestBody)
+			if !bytes.Equal(stripped, requestBody) {
+				requestBody = stripped
+				samplingRetried = true
 				continue
 			}
 		}

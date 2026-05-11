@@ -3,6 +3,7 @@ package bedrock
 import (
 	"fmt"
 	"math"
+	"regexp"
 	"strings"
 
 	"github.com/tidwall/gjson"
@@ -68,6 +69,18 @@ func SanitizeForBedrockCompat(body []byte) []byte {
 
 	body = EnsureMaxTokensAboveThinkingBudget(body)
 
+	// Anthropic rule (enforced by Bedrock): when extended thinking is on,
+	// `temperature` must be 1 and `top_p` / `top_k` are not allowed. Rather
+	// than try to clamp temperature, strip all three — the model picks
+	// sensible defaults and the caller's intent of "no sampling override"
+	// is preserved. The model-specific always-on adaptive case (Opus 4.7
+	// without an explicit thinking block) is handled later by
+	// AdaptThinkingForModel, which calls StripSamplingParams again.
+	switch gjson.GetBytes(body, "thinking.type").String() {
+	case "enabled", "adaptive":
+		body = StripSamplingParams(body)
+	}
+
 	// cache_control is SUPPORTED by Bedrock, but the "scope" sub-field is NOT.
 	// Claude Code CLI sends cache_control like {"type":"ephemeral","scope":"turn"}
 	// Bedrock only accepts {"type":"ephemeral"}, so strip just the scope field.
@@ -124,6 +137,56 @@ func EnsureMaxTokensAboveThinkingBudget(body []byte) []byte {
 		body, _ = sjson.SetBytes(body, "max_tokens", newMax)
 	}
 	return body
+}
+
+// samplingParamFields lists the sampling-control fields that Anthropic's
+// extended-thinking mode rejects. Kept as a package-level slice so the
+// error-driven retry path can iterate the same set without drift.
+var samplingParamFields = []string{"temperature", "top_p", "top_k"}
+
+// StripSamplingParams removes `temperature`, `top_p`, and `top_k` from the
+// request body. Exported for reuse by AdaptThinkingForModel (model-specific
+// always-on adaptive) and the adapter's error-driven retry path.
+func StripSamplingParams(body []byte) []byte {
+	for _, field := range samplingParamFields {
+		if gjson.GetBytes(body, field).Exists() {
+			body, _ = sjson.DeleteBytes(body, field)
+		}
+	}
+	return body
+}
+
+// samplingParamRejectedPattern matches Bedrock 400 validation messages that
+// reject `temperature` / `top_p` / `top_k` because the target model is in
+// (possibly always-on) extended-thinking mode. Wording shifts across
+// releases — the Anthropic-style format wraps the field in backticks
+// ("`temperature` may only be set to 1 when thinking is enabled") while
+// the Bedrock-native format drops them — and the field may appear before
+// or after the thinking clause.
+//
+// The pattern requires both (a) one of the rejected field names and
+// (b) a phrase that anchors "thinking" to its rejection role: either a
+// preposition + "thinking" (e.g. "when thinking", "with extended
+// thinking") or "thinking is enabled/active/on" / "thinking mode".
+// Bare co-occurrence is intentionally NOT enough — a message like
+// "temperature must be between 0 and 1; thinking budget exceeds
+// max_tokens" mentions both but is not a thinking-mode rejection;
+// "thinking" there is a noun modifier of "budget", not the verb
+// describing the model state, so it must not trigger a body-mutating
+// retry.
+var samplingParamRejectedPattern = regexp.MustCompile(
+	`\b(?:temperature|top_p|top_k)\b[^\n]{0,200}` +
+		`(?:\b(?:when|with|during|while|in)\s+(?:extended\s+|adaptive\s+)?thinking\b|\bthinking\s+(?:is\s+(?:enabled|active|on)|mode)\b)` +
+		`|` +
+		`(?:\b(?:when|with|during|while|in)\s+(?:extended\s+|adaptive\s+)?thinking\b|\bthinking\s+(?:is\s+(?:enabled|active|on)|mode)\b)` +
+		`[^\n]{0,200}\b(?:temperature|top_p|top_k)\b`,
+)
+
+// IsSamplingParamRejectedError reports whether the upstream error body is
+// a Bedrock rejection of temperature / top_p / top_k that can be recovered
+// from by stripping those fields and replaying once.
+func IsSamplingParamRejectedError(body []byte) bool {
+	return samplingParamRejectedPattern.Match(body)
 }
 
 // RemoveOrphanedToolResults removes tool_result blocks from user messages
