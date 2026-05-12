@@ -17,9 +17,10 @@ import (
 // - Then runs the relay-safe transformations via SanitizeForBedrockCompat.
 //
 // Bedrock feature support (verified via real API tests):
-//   ACCEPTED: cache_control (system/tools/messages), thinking(enabled), tools, tool_use
-//   REJECTED: stream, output_config, context_management, reasoning, betas,
-//             thinking(adaptive), tools[].custom, cache_control.scope
+//
+//	ACCEPTED: cache_control (system/tools/messages), thinking(enabled), tools, tool_use
+//	REJECTED: stream, output_config, context_management, reasoning, betas,
+//	          thinking(adaptive), tools[].custom, cache_control.scope
 func sanitizeRequestBody(body []byte) []byte {
 	// Remove `model` field (Bedrock uses URL path)
 	body, _ = sjson.DeleteBytes(body, "model")
@@ -96,6 +97,8 @@ func SanitizeForBedrockCompat(body []byte) []byte {
 			}
 		}
 	}
+
+	body = NormalizeToolIdentifiers(body)
 
 	// Remove empty top-level arrays that Bedrock rejects with ValidationException.
 	// Clients sometimes send `"system":[]` or `"tools":[]` which Anthropic API
@@ -290,6 +293,157 @@ func RemoveOrphanedToolResults(body []byte) []byte {
 		return body
 	}
 	return updatedBody
+}
+
+// toolIdentifierInvalidChar matches any character disallowed in Bedrock's
+// tool identifier pattern. Bedrock validates tool_use.id, tool_result.tool_use_id,
+// tool_use.name, and tools[].name against `^[a-zA-Z0-9_-]+$` (name additionally
+// capped at 128 chars), and rejects requests with characters like `.` or `:`.
+// Some clients/SDKs synthesize ids like "functions.foo:0" which fail this regex.
+var toolIdentifierInvalidChar = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
+
+// newToolIdentifierResolver returns a resolver closure that maps an original
+// identifier to a Bedrock-valid form, disambiguating collisions across a
+// single request. maxLen > 0 enforces a length cap; suffix allocation
+// re-truncates the base so the final candidate (base + "_<n>") stays
+// within the cap.
+func newToolIdentifierResolver(maxLen int) func(string) string {
+	mapping := make(map[string]string)
+	used := make(map[string]bool)
+	return func(original string) string {
+		if original == "" {
+			return original
+		}
+		if mapped, ok := mapping[original]; ok {
+			return mapped
+		}
+		base := toolIdentifierInvalidChar.ReplaceAllString(original, "_")
+		if maxLen > 0 && len(base) > maxLen {
+			base = base[:maxLen]
+		}
+		candidate := base
+		for n := 1; used[candidate]; n++ {
+			suffix := fmt.Sprintf("_%d", n)
+			trunc := base
+			if maxLen > 0 && len(trunc)+len(suffix) > maxLen {
+				trunc = base[:maxLen-len(suffix)]
+			}
+			candidate = trunc + suffix
+		}
+		mapping[original] = candidate
+		used[candidate] = true
+		return candidate
+	}
+}
+
+// NormalizeToolIdentifiers replaces characters that Bedrock rejects in tool
+// identifier fields. Covers:
+//   - messages[*].content[*].id (tool_use)
+//   - messages[*].content[*].name (tool_use)
+//   - messages[*].content[*].tool_use_id (tool_result)
+//   - tools[*].name
+//
+// Reference pairs stay consistent because we build request-wide
+// original→normalized maps and apply them on both ends:
+//   - id map links tool_use.id ↔ tool_result.tool_use_id
+//   - name map links tools[].name (definition) ↔ tool_use.name (reference)
+//
+// Collisions get a stable `_<n>` suffix so two distinct originals (e.g.
+// `functions.foo` and `functions/foo`, both collapsing to `functions_foo`)
+// stay distinguishable on the wire. Names are capped at Bedrock's 128-char
+// limit, and suffix allocation truncates the base if needed to keep the
+// total within that cap.
+func NormalizeToolIdentifiers(body []byte) []byte {
+	resolveID := newToolIdentifierResolver(0)
+	resolveName := newToolIdentifierResolver(128)
+
+	// First pass (forward order, definitions before references): build maps.
+	// tools[] is walked before messages so tool definitions own canonical
+	// names; tool_use.name references then resolve through the same map.
+	tools := gjson.GetBytes(body, "tools")
+	if tools.IsArray() {
+		tn := int(tools.Get("#").Int())
+		for i := 0; i < tn; i++ {
+			path := fmt.Sprintf("tools.%d.name", i)
+			if name := gjson.GetBytes(body, path).String(); name != "" {
+				_ = resolveName(name)
+			}
+		}
+	}
+	messages := gjson.GetBytes(body, "messages")
+	if messages.IsArray() {
+		n := int(messages.Get("#").Int())
+		for i := 0; i < n; i++ {
+			content := gjson.GetBytes(body, fmt.Sprintf("messages.%d.content", i))
+			if !content.IsArray() {
+				continue
+			}
+			cn := int(content.Get("#").Int())
+			for j := 0; j < cn; j++ {
+				blockPath := fmt.Sprintf("messages.%d.content.%d", i, j)
+				switch gjson.GetBytes(body, blockPath+".type").String() {
+				case "tool_use":
+					if id := gjson.GetBytes(body, blockPath+".id").String(); id != "" {
+						_ = resolveID(id)
+					}
+					if name := gjson.GetBytes(body, blockPath+".name").String(); name != "" {
+						_ = resolveName(name)
+					}
+				case "tool_result":
+					if id := gjson.GetBytes(body, blockPath+".tool_use_id").String(); id != "" {
+						_ = resolveID(id)
+					}
+				}
+			}
+		}
+	}
+
+	// Second pass: apply mappings. Order doesn't matter for correctness
+	// (only scalar fields are rewritten), but reverse iteration keeps the
+	// pattern consistent with other sanitizer helpers in this file.
+	if messages.IsArray() {
+		for i := int(messages.Get("#").Int()) - 1; i >= 0; i-- {
+			content := gjson.GetBytes(body, fmt.Sprintf("messages.%d.content", i))
+			if !content.IsArray() {
+				continue
+			}
+			for j := int(content.Get("#").Int()) - 1; j >= 0; j-- {
+				blockPath := fmt.Sprintf("messages.%d.content.%d", i, j)
+				switch gjson.GetBytes(body, blockPath+".type").String() {
+				case "tool_use":
+					if id := gjson.GetBytes(body, blockPath+".id").String(); id != "" {
+						if mapped := resolveID(id); mapped != id {
+							body, _ = sjson.SetBytes(body, blockPath+".id", mapped)
+						}
+					}
+					if name := gjson.GetBytes(body, blockPath+".name").String(); name != "" {
+						if mapped := resolveName(name); mapped != name {
+							body, _ = sjson.SetBytes(body, blockPath+".name", mapped)
+						}
+					}
+				case "tool_result":
+					if id := gjson.GetBytes(body, blockPath+".tool_use_id").String(); id != "" {
+						if mapped := resolveID(id); mapped != id {
+							body, _ = sjson.SetBytes(body, blockPath+".tool_use_id", mapped)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if tools.IsArray() {
+		for i := int(tools.Get("#").Int()) - 1; i >= 0; i-- {
+			path := fmt.Sprintf("tools.%d.name", i)
+			if name := gjson.GetBytes(body, path).String(); name != "" {
+				if mapped := resolveName(name); mapped != name {
+					body, _ = sjson.SetBytes(body, path, mapped)
+				}
+			}
+		}
+	}
+
+	return body
 }
 
 // stripCacheControlScope removes the "scope" sub-field from all cache_control objects.

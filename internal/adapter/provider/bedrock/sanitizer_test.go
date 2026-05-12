@@ -3,6 +3,7 @@ package bedrock
 import (
 	"fmt"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -487,4 +488,300 @@ func TestSanitizeRequestBodyRemovesModelAndStream(t *testing.T) {
 	if got := gjson.GetBytes(result, "anthropic_version").String(); got != BedrockAPIVersion {
 		t.Errorf("anthropic_version = %q, want %q", got, BedrockAPIVersion)
 	}
+}
+
+func TestNormalizeToolIdentifiers(t *testing.T) {
+	t.Run("rewrites tool_use.id and matching tool_result.tool_use_id", func(t *testing.T) {
+		body := []byte(`{
+			"messages":[
+				{"role":"assistant","content":[
+					{"type":"tool_use","id":"functions.foo:0","name":"functions.foo","input":{}}
+				]},
+				{"role":"user","content":[
+					{"type":"tool_result","tool_use_id":"functions.foo:0","content":"ok"}
+				]}
+			]
+		}`)
+
+		result := NormalizeToolIdentifiers(body)
+
+		gotID := gjson.GetBytes(result, "messages.0.content.0.id").String()
+		if gotID != "functions_foo_0" {
+			t.Errorf("tool_use.id = %q, want functions_foo_0", gotID)
+		}
+		gotName := gjson.GetBytes(result, "messages.0.content.0.name").String()
+		if gotName != "functions_foo" {
+			t.Errorf("tool_use.name = %q, want functions_foo", gotName)
+		}
+		gotRefID := gjson.GetBytes(result, "messages.1.content.0.tool_use_id").String()
+		if gotRefID != gotID {
+			t.Errorf("tool_result.tool_use_id = %q, want matching %q", gotRefID, gotID)
+		}
+	})
+
+	t.Run("preserves already-valid identifiers", func(t *testing.T) {
+		body := []byte(`{
+			"messages":[
+				{"role":"assistant","content":[
+					{"type":"tool_use","id":"toolu_abc-123","name":"my_tool","input":{}}
+				]}
+			]
+		}`)
+
+		result := NormalizeToolIdentifiers(body)
+
+		if gjson.GetBytes(result, "messages.0.content.0.id").String() != "toolu_abc-123" {
+			t.Errorf("valid id mutated: %s", result)
+		}
+		if gjson.GetBytes(result, "messages.0.content.0.name").String() != "my_tool" {
+			t.Errorf("valid name mutated: %s", result)
+		}
+	})
+
+	t.Run("disambiguates colliding originals", func(t *testing.T) {
+		body := []byte(`{
+			"messages":[
+				{"role":"assistant","content":[
+					{"type":"tool_use","id":"foo_bar","name":"a","input":{}},
+					{"type":"tool_use","id":"foo.bar","name":"b","input":{}}
+				]},
+				{"role":"user","content":[
+					{"type":"tool_result","tool_use_id":"foo_bar","content":"r0"},
+					{"type":"tool_result","tool_use_id":"foo.bar","content":"r1"}
+				]}
+			]
+		}`)
+
+		result := NormalizeToolIdentifiers(body)
+
+		id0 := gjson.GetBytes(result, "messages.0.content.0.id").String()
+		id1 := gjson.GetBytes(result, "messages.0.content.1.id").String()
+		ref0 := gjson.GetBytes(result, "messages.1.content.0.tool_use_id").String()
+		ref1 := gjson.GetBytes(result, "messages.1.content.1.tool_use_id").String()
+
+		if id0 != "foo_bar" {
+			t.Errorf("first id should keep canonical form, got %q", id0)
+		}
+		if id1 == id0 {
+			t.Errorf("colliding ids must disambiguate, both got %q", id0)
+		}
+		if ref0 != id0 {
+			t.Errorf("tool_result[0] should match tool_use[0]: %q vs %q", ref0, id0)
+		}
+		if ref1 != id1 {
+			t.Errorf("tool_result[1] should match tool_use[1]: %q vs %q", ref1, id1)
+		}
+	})
+
+	t.Run("handles multiple tool_use blocks in one message", func(t *testing.T) {
+		body := []byte(`{
+			"messages":[
+				{"role":"assistant","content":[
+					{"type":"text","text":"thinking..."},
+					{"type":"tool_use","id":"a.1","name":"f.x","input":{}},
+					{"type":"tool_use","id":"a.2","name":"f.y","input":{}},
+					{"type":"tool_use","id":"a.3","name":"f.z","input":{}}
+				]}
+			]
+		}`)
+
+		result := NormalizeToolIdentifiers(body)
+
+		for j, want := range []string{"a_1", "a_2", "a_3"} {
+			path := fmt.Sprintf("messages.0.content.%d.id", j+1)
+			if got := gjson.GetBytes(result, path).String(); got != want {
+				t.Errorf("content.%d.id = %q, want %q", j+1, got, want)
+			}
+		}
+	})
+
+	t.Run("caps tool_use.name in messages content", func(t *testing.T) {
+		longName := strings.Repeat("a.", 80) // 160 chars, also contains invalid `.`
+		body := []byte(`{
+			"messages":[
+				{"role":"assistant","content":[
+					{"type":"tool_use","id":"toolu_1","name":"` + longName + `","input":{}}
+				]}
+			]
+		}`)
+
+		result := NormalizeToolIdentifiers(body)
+
+		got := gjson.GetBytes(result, "messages.0.content.0.name").String()
+		if len(got) != 128 {
+			t.Errorf("tool_use.name length = %d, want 128", len(got))
+		}
+		if toolIdentifierInvalidChar.MatchString(got) {
+			t.Errorf("tool_use.name still contains invalid chars: %q", got)
+		}
+	})
+
+	t.Run("suffix skips slots already taken by a valid id", func(t *testing.T) {
+		// `foo_bar_1` is already valid; `foo_bar` is already valid;
+		// `foo.bar` would collapse onto `foo_bar` → suffixed to `foo_bar_1` (taken)
+		// → must bump to `foo_bar_2`.
+		body := []byte(`{
+			"messages":[
+				{"role":"assistant","content":[
+					{"type":"tool_use","id":"foo_bar_1","name":"a","input":{}},
+					{"type":"tool_use","id":"foo_bar","name":"b","input":{}},
+					{"type":"tool_use","id":"foo.bar","name":"c","input":{}}
+				]}
+			]
+		}`)
+
+		result := NormalizeToolIdentifiers(body)
+		ids := []string{
+			gjson.GetBytes(result, "messages.0.content.0.id").String(),
+			gjson.GetBytes(result, "messages.0.content.1.id").String(),
+			gjson.GetBytes(result, "messages.0.content.2.id").String(),
+		}
+		want := []string{"foo_bar_1", "foo_bar", "foo_bar_2"}
+		for i, w := range want {
+			if ids[i] != w {
+				t.Errorf("ids[%d] = %q, want %q (all=%v)", i, ids[i], w, ids)
+			}
+		}
+	})
+
+	t.Run("repeated original id maps to same normalized value", func(t *testing.T) {
+		body := []byte(`{
+			"messages":[
+				{"role":"assistant","content":[
+					{"type":"tool_use","id":"x.1","name":"a","input":{}}
+				]},
+				{"role":"user","content":[
+					{"type":"tool_result","tool_use_id":"x.1","content":"r1"},
+					{"type":"tool_result","tool_use_id":"x.1","content":"r2"}
+				]}
+			]
+		}`)
+
+		result := NormalizeToolIdentifiers(body)
+		id := gjson.GetBytes(result, "messages.0.content.0.id").String()
+		ref0 := gjson.GetBytes(result, "messages.1.content.0.tool_use_id").String()
+		ref1 := gjson.GetBytes(result, "messages.1.content.1.tool_use_id").String()
+		if id == "" || id != ref0 || id != ref1 {
+			t.Errorf("repeated original should map identically: id=%q ref0=%q ref1=%q", id, ref0, ref1)
+		}
+	})
+
+	t.Run("ignores non-array message content", func(t *testing.T) {
+		body := []byte(`{"messages":[{"role":"user","content":"plain string"}]}`)
+		result := NormalizeToolIdentifiers(body)
+		if gjson.GetBytes(result, "messages.0.content").String() != "plain string" {
+			t.Errorf("plain-string content should be untouched: %s", result)
+		}
+	})
+
+	t.Run("disambiguates colliding tool names across tools[] and tool_use", func(t *testing.T) {
+		// Regression: two distinct tool definitions whose names collapse to
+		// the same Bedrock-valid form must stay distinguishable on the wire,
+		// and tool_use.name references must follow the same mapping so that
+		// each tool_use points to the right (renamed) definition.
+		body := []byte(`{
+			"tools":[
+				{"name":"functions.foo","description":"a","input_schema":{}},
+				{"name":"functions/foo","description":"b","input_schema":{}}
+			],
+			"messages":[{"role":"assistant","content":[
+				{"type":"tool_use","id":"id1","name":"functions.foo","input":{}},
+				{"type":"tool_use","id":"id2","name":"functions/foo","input":{}}
+			]}]
+		}`)
+
+		result := NormalizeToolIdentifiers(body)
+
+		t0 := gjson.GetBytes(result, "tools.0.name").String()
+		t1 := gjson.GetBytes(result, "tools.1.name").String()
+		u0 := gjson.GetBytes(result, "messages.0.content.0.name").String()
+		u1 := gjson.GetBytes(result, "messages.0.content.1.name").String()
+
+		if t0 == t1 {
+			t.Errorf("tools[] names must not collide, both = %q", t0)
+		}
+		if u0 == u1 {
+			t.Errorf("tool_use names must not collide, both = %q", u0)
+		}
+		if t0 != u0 {
+			t.Errorf("tool_use[0].name should match tools[0].name: %q vs %q", u0, t0)
+		}
+		if t1 != u1 {
+			t.Errorf("tool_use[1].name should match tools[1].name: %q vs %q", u1, t1)
+		}
+		// And the first-occurrence original wins canonical form.
+		if t0 != "functions_foo" {
+			t.Errorf("tools[0].name should keep canonical form, got %q", t0)
+		}
+	})
+
+	t.Run("suffix respects 128-char name cap", func(t *testing.T) {
+		// Two long names that collapse to the same 128-char base. Suffix
+		// allocation must re-truncate the base so `base + "_1"` stays ≤ 128.
+		long := strings.Repeat("a", 130)
+		body := []byte(`{
+			"tools":[
+				{"name":"` + long + `.x"},
+				{"name":"` + long + `/x"}
+			],
+			"messages":[{"role":"user","content":"hi"}]
+		}`)
+
+		result := NormalizeToolIdentifiers(body)
+		t0 := gjson.GetBytes(result, "tools.0.name").String()
+		t1 := gjson.GetBytes(result, "tools.1.name").String()
+		if len(t0) > 128 || len(t1) > 128 {
+			t.Errorf("names exceed 128-char cap: %d, %d", len(t0), len(t1))
+		}
+		if t0 == t1 {
+			t.Errorf("names should be distinct after suffix, both = %q", t0)
+		}
+	})
+
+	t.Run("normalizes tools[].name", func(t *testing.T) {
+		body := []byte(`{
+			"tools":[{"name":"functions.bar","description":"d","input_schema":{}}],
+			"messages":[{"role":"user","content":"hi"}]
+		}`)
+
+		result := NormalizeToolIdentifiers(body)
+
+		if got := gjson.GetBytes(result, "tools.0.name").String(); got != "functions_bar" {
+			t.Errorf("tools[0].name = %q, want functions_bar", got)
+		}
+	})
+
+	t.Run("caps name at 128 chars", func(t *testing.T) {
+		longName := strings.Repeat("a", 150)
+		body := []byte(`{"tools":[{"name":"` + longName + `"}],"messages":[{"role":"user","content":"hi"}]}`)
+
+		result := NormalizeToolIdentifiers(body)
+
+		got := gjson.GetBytes(result, "tools.0.name").String()
+		if len(got) != 128 {
+			t.Errorf("tools[0].name length = %d, want 128", len(got))
+		}
+	})
+
+	t.Run("integrates via SanitizeForBedrockCompat", func(t *testing.T) {
+		body := []byte(`{
+			"messages":[
+				{"role":"assistant","content":[
+					{"type":"tool_use","id":"functions.x:1","name":"functions.x","input":{}}
+				]},
+				{"role":"user","content":[
+					{"type":"tool_result","tool_use_id":"functions.x:1","content":"ok"}
+				]}
+			]
+		}`)
+
+		result := SanitizeForBedrockCompat(body)
+
+		if got := gjson.GetBytes(result, "messages.0.content.0.id").String(); got != "functions_x_1" {
+			t.Errorf("SanitizeForBedrockCompat did not normalize tool_use.id: %q", got)
+		}
+		if got := gjson.GetBytes(result, "messages.1.content.0.tool_use_id").String(); got != "functions_x_1" {
+			t.Errorf("SanitizeForBedrockCompat did not normalize tool_result.tool_use_id: %q", got)
+		}
+	})
 }
