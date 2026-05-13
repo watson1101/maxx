@@ -446,6 +446,56 @@ func TestIsSamplingParamRejectedError(t *testing.T) {
 			body: `{"message":"thinking budget too low; temperature was 0.7"}`,
 			want: false,
 		},
+		{
+			// Production regression captured 2026-05-12 onward: Bedrock now
+			// emits this wording for claude-opus-4-7 instead of the older
+			// "may only be set to 1 when thinking is enabled" form. No
+			// mention of thinking, but the recovery (strip + replay) is
+			// the same.
+			name: "deprecation wording (backticks)",
+			body: `{"message":"` + "`temperature`" + ` is deprecated for this model."}`,
+			want: true,
+		},
+		{
+			name: "deprecation wording (no backticks)",
+			body: `{"message":"top_p is deprecated for this model."}`,
+			want: true,
+		},
+		{
+			name: "deprecation wording (reversed clause)",
+			body: `{"message":"deprecated parameter: temperature"}`,
+			want: true,
+		},
+		{
+			name: "false-positive guard: unrelated deprecation",
+			body: `{"message":"this endpoint is deprecated, use v2"}`,
+			want: false,
+		},
+		{
+			name: "deprecation wording for top_k",
+			body: `{"message":"top_k is deprecated for this model."}`,
+			want: true,
+		},
+		{
+			// Defensive: longer prose wording within the 200-char window.
+			name: "deprecation wording with extended prose",
+			body: `{"message":"` + "`temperature`" + ` is deprecated for this model when extended thinking is used; use the default behavior instead."}`,
+			want: true,
+		},
+		{
+			// Boundary: field and `deprecated` separated by ~190 chars of
+			// filler to exercise the 200-char proximity window.
+			name: "deprecation wording near 200-char boundary",
+			body: `{"message":"temperature ` + strings.Repeat("x", 190) + ` is deprecated."}`,
+			want: true,
+		},
+		{
+			// Boundary: same shape but pushed past 200 chars between the
+			// field and `deprecated` — should NOT match.
+			name: "deprecation wording beyond 200-char boundary",
+			body: `{"message":"temperature ` + strings.Repeat("x", 220) + ` is deprecated."}`,
+			want: false,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
