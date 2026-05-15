@@ -136,11 +136,26 @@ func main() {
 		log.Printf("Warning: Failed to load cooldowns from database: %v", err)
 	}
 
-	// Generate instance ID and mark stale requests as failed
+	// Generate instance ID
 	instanceID := generateInstanceID()
+
+	// Setup coordinator (mode + heartbeat + cooldown wiring).
+	// 必须在 MarkStaleAsFailed 和任何会写入 proxy_requests.instance_id 的代码路径
+	// (主要是 HTTP server) 之前完成 RegisterInstance,否则其他实例可能误判本实
+	// 例为"死亡"并清理本实例刚下发的请求。
+	coordComp, err := core.SetupCoordinator(context.Background(), instanceID, false)
+	if err != nil {
+		log.Fatalf("[Startup] coordinator setup: %v", err)
+	}
+	coord := coordComp.Coordinator
+	coordCtx := coordComp.Ctx
+
 	startupStep := time.Now()
 	log.Printf("[Startup] Marking stale requests as failed...")
-	if count, err := proxyRequestRepo.MarkStaleAsFailed(instanceID); err != nil {
+	aliveInstances, err := coord.ListAliveInstances(coordCtx)
+	if err != nil {
+		log.Printf("Warning: ListAliveInstances failed: %v (skipping stale sweep)", err)
+	} else if count, err := proxyRequestRepo.MarkStaleAsFailed(aliveInstances); err != nil {
 		log.Printf("Warning: Failed to mark stale requests: %v", err)
 	} else {
 		log.Printf("[Startup] Marked %d stale requests as failed (%v)", count, time.Since(startupStep))
@@ -179,6 +194,19 @@ func main() {
 	cachedAPITokenRepo := cached.NewAPITokenRepository(apiTokenRepo)
 	cachedModelMappingRepo := cached.NewModelMappingRepository(modelMappingRepo)
 
+	// Wire cross-instance cache invalidation. AttachCachedReposToCoordinator
+	// 是 desktop launcher 也走的同一个 helper,保证两条启动路径行为一致。
+	core.AttachCachedReposToCoordinator(coordCtx, coord, &core.DatabaseRepos{
+		CachedProviderRepo:        cachedProviderRepo,
+		CachedRouteRepo:           cachedRouteRepo,
+		CachedRetryConfigRepo:     cachedRetryConfigRepo,
+		CachedRoutingStrategyRepo: cachedRoutingStrategyRepo,
+		CachedProjectRepo:         cachedProjectRepo,
+		CachedAPITokenRepo:        cachedAPITokenRepo,
+		CachedModelMappingRepo:    cachedModelMappingRepo,
+		CachedSessionRepo:         cachedSessionRepo,
+	})
+
 	// Load cached data
 	startupStep = time.Now()
 	log.Printf("[Startup] Loading caches...")
@@ -215,6 +243,32 @@ func main() {
 		log.Printf("Warning: Failed to initialize adapters: %v", err)
 	}
 	log.Printf("[Startup] Provider adapters initialized (%v)", time.Since(startupStep))
+
+	// Periodic sweep: 周期性基于活实例列表清理孤儿请求。多实例环境下,
+	// 这让活的实例能持续回收已死实例(实例突然崩溃、未走优雅关闭)留下的
+	// in-progress 请求。频率由 MAXX_PROXY_REQUEST_SWEEP_INTERVAL 控制
+	// (默认 45s,见 RFC)。
+	go func() {
+		ticker := time.NewTicker(coordComp.Config.SweepInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-coordCtx.Done():
+				return
+			case <-ticker.C:
+				alive, err := coord.ListAliveInstances(coordCtx)
+				if err != nil {
+					log.Printf("[Coordinator] periodic sweep: ListAlive failed: %v", err)
+					continue
+				}
+				if count, err := proxyRequestRepo.MarkStaleAsFailed(alive); err != nil {
+					log.Printf("[Coordinator] periodic sweep: MarkStaleAsFailed failed: %v", err)
+				} else if count > 0 {
+					log.Printf("[Coordinator] periodic sweep: marked %d stale requests as failed", count)
+				}
+			}
+		}
+	}()
 
 	// Start cooldown cleanup goroutine with graceful shutdown support
 	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
@@ -511,6 +565,9 @@ func main() {
 
 		// Stop background cleanup task
 		cleanupCancel()
+
+		// Cleanup 内部顺序:UnregisterInstance → cancel ctx → close coordinator
+		coordComp.Cleanup()
 
 		// Stop pprof manager
 		if err := pprofMgr.Stop(shutdownCtx); err != nil {

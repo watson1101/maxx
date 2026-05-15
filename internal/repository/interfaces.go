@@ -99,7 +99,19 @@ type SessionRepository interface {
 	Touch(tenantID uint64, sessionID string, touchedAt time.Time) error
 	GetBySessionID(tenantID uint64, sessionID string) (*domain.Session, error)
 	List(tenantID uint64) ([]*domain.Session, error)
+	// ListExpiredKeys 返回 updated_at 早于 before 的 session 标识。
+	// 用于跨实例 KV 同步:DeleteOlderThan 之前先取要删的 keys,
+	// DB 删除完成后用这些 keys 同步删除 coordinator KV 上的副本,
+	// 避免其他实例仍从 KV 读到已被 hard-delete 的 session(stale read)。
+	ListExpiredKeys(before time.Time) ([]SessionKey, error)
 	DeleteOlderThan(before time.Time) (int64, error)
+}
+
+// SessionKey 是 session 的最小标识,用于 ListExpiredKeys 等只需 (tenant, session_id)
+// 的批量操作,避免拉整行 domain.Session 浪费内存/带宽。
+type SessionKey struct {
+	TenantID  uint64
+	SessionID string
 }
 
 // ProxyRequestFilter 请求列表过滤条件
@@ -128,9 +140,14 @@ type ProxyRequestRepository interface {
 	CountWithFilter(tenantID uint64, filter *ProxyRequestFilter) (int64, error)
 	// UpdateProjectIDBySessionID 批量更新指定 sessionID 的所有请求的 projectID
 	UpdateProjectIDBySessionID(tenantID uint64, sessionID string, projectID uint64) (int64, error)
-	// MarkStaleAsFailed marks all IN_PROGRESS/PENDING requests from other instances as FAILED
-	// Also marks requests that have been IN_PROGRESS for too long (> 30 minutes) as timed out
-	MarkStaleAsFailed(currentInstanceID string) (int64, error)
+	// MarkStaleAsFailed marks IN_PROGRESS/PENDING requests as FAILED when their
+	// owning instance is no longer alive, or when start_time is older than 30 minutes.
+	//
+	// aliveInstanceIDs 必须由 coordinator.ListAliveInstances 提供。一个安全门:
+	// 当 aliveInstanceIDs 为空(说明 coordinator 异常或刚启动)时,实现应跳过
+	// 清理,绝不基于"没有活实例"的假设把所有 in-progress 请求都标记 FAILED。
+	// 这样多实例环境下后启动的实例不会误杀先启动实例的在飞请求。
+	MarkStaleAsFailed(aliveInstanceIDs []string) (int64, error)
 	// FixFailedRequestsWithoutEndTime fixes FAILED requests that have no end_time set
 	FixFailedRequestsWithoutEndTime() (int64, error)
 	// DeleteOlderThan 删除指定时间之前的请求记录
