@@ -1171,6 +1171,42 @@ func TestProxyAllProtocolsCoexist(t *testing.T) {
 // ============================================================
 
 func TestTokenConcurrencyLimitRecordsRejectedRequest(t *testing.T) {
+	cases := []struct {
+		name               string
+		configureRetention func(t *testing.T, env *ProxyTestEnv)
+	}{
+		{
+			name: "unified retention zero",
+			configureRetention: func(t *testing.T, env *ProxyTestEnv) {
+				setRequestDetailRetentionSetting(t, env, "request_detail_retention_seconds", "0")
+			},
+		},
+		{
+			name: "split failed retention zero",
+			configureRetention: func(t *testing.T, env *ProxyTestEnv) {
+				setRequestDetailRetentionSetting(t, env, "request_detail_retention_seconds", "86400")
+				setRequestDetailRetentionSetting(t, env, "request_detail_retention_split_enabled", "true")
+				setRequestDetailRetentionSetting(t, env, "request_detail_retention_seconds_success", "86400")
+				setRequestDetailRetentionSetting(t, env, "request_detail_retention_seconds_failed", "0")
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runTokenConcurrencyLimitRecordsRejectedRequest(t, tc.configureRetention)
+		})
+	}
+}
+
+func setRequestDetailRetentionSetting(t *testing.T, env *ProxyTestEnv, key, value string) {
+	t.Helper()
+	resp := env.AdminPut("/api/admin/settings/"+key, map[string]any{"value": value})
+	AssertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+}
+
+func runTokenConcurrencyLimitRecordsRejectedRequest(t *testing.T, configureRetention func(t *testing.T, env *ProxyTestEnv)) {
 	blocked := make(chan struct{})
 	entered := make(chan struct{}, 1)
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1200,6 +1236,8 @@ func TestTokenConcurrencyLimitRecordsRejectedRequest(t *testing.T) {
 	env := NewProxyTestEnv(t)
 	providerID := createProvider(t, env, "mock-openai", mock.URL, []string{"openai"})
 	createRoute(t, env, "openai", providerID)
+
+	configureRetention(t, env)
 
 	resp := env.AdminPut("/api/admin/settings/api_token_auth_enabled", map[string]any{"value": "true"})
 	AssertStatus(t, resp, http.StatusOK)
@@ -1246,7 +1284,14 @@ func TestTokenConcurrencyLimitRecordsRejectedRequest(t *testing.T) {
 		t.Fatal("timed out waiting for first request to reach upstream")
 	}
 
-	resp = env.ProxyPost("/v1/chat/completions", openaiRequest("gpt-4o"), map[string]string{
+	secretPayload := map[string]any{
+		"model": "gpt-4o",
+		"messages": []map[string]any{{
+			"role":    "user",
+			"content": "do not persist rejected payload",
+		}},
+	}
+	resp = env.ProxyPost("/v1/chat/completions", secretPayload, map[string]string{
 		"Authorization": "Bearer " + tokenStr,
 	})
 	AssertStatus(t, resp, http.StatusTooManyRequests)
@@ -1262,6 +1307,7 @@ func TestTokenConcurrencyLimitRecordsRejectedRequest(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	foundRejected := false
 	foundActive := false
+	rejectedID := 0
 	for {
 		resp = env.AdminGet(fmt.Sprintf("/api/admin/requests?limit=20&apiTokenId=%d", apiTokenID))
 		AssertStatus(t, resp, http.StatusOK)
@@ -1284,6 +1330,7 @@ func TestTokenConcurrencyLimitRecordsRejectedRequest(t *testing.T) {
 			errorMsg, _ := request["error"].(string)
 			if status == "REJECTED" && int(statusCode) == http.StatusTooManyRequests && strings.Contains(errorMsg, "concurrent request limit") {
 				foundRejected = true
+				rejectedID = int(request["id"].(float64))
 			}
 			if status == "PENDING" || status == "IN_PROGRESS" || status == "COMPLETED" {
 				foundActive = true
@@ -1296,6 +1343,17 @@ func TestTokenConcurrencyLimitRecordsRejectedRequest(t *testing.T) {
 			t.Fatalf("expected rejected+active requests, got items=%v", items)
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+
+	resp = env.AdminGet(fmt.Sprintf("/api/admin/requests/%d", rejectedID))
+	AssertStatus(t, resp, http.StatusOK)
+	var rejected map[string]any
+	DecodeJSON(t, resp, &rejected)
+	if rejected["requestInfo"] != nil {
+		t.Fatalf("requestInfo must be nil when retention clears failed requests, got %#v", rejected["requestInfo"])
+	}
+	if rejected["responseInfo"] != nil {
+		t.Fatalf("responseInfo must be nil when retention clears failed requests, got %#v", rejected["responseInfo"])
 	}
 
 	close(blocked)
