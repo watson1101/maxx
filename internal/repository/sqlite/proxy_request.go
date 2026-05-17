@@ -487,6 +487,48 @@ func (r *ProxyRequestRepository) RecalculateCostsFromAttemptsWithProgress(progre
 	return totalUpdated, nil
 }
 
+// detailCleanupIndexMissing 由启动时健康检查置位:MySQL detail-cleanup 索引不存在时
+// 设为 1。设置后 detailCleanupBatchParams 退化回保守批次(200/50ms),避免在无索引的
+// 大表上以 batch=1000 反复触发 full-table-scan 把 IOPS 打满。
+//
+// 用 atomic.Int32 而非 mutex:写一次(启动),读高频(每次清理批次),无锁读最便宜。
+var detailCleanupIndexMissing atomic.Int32
+
+// SetDetailCleanupIndexMissing 设置 MySQL detail-cleanup 索引缺失状态。startup
+// health-check 调用,见 internal/core/task.go:checkDetailCleanupIndexHealth。
+//
+// 显式 set(true/false):每次启动健康检查时都覆盖写,避免之前进程态/测试态遗留的 sticky
+// 标志位污染后续判断。同进程内若索引被运维补建,需要重启进程才能恢复 fast-path;
+// 这是可接受的权衡——避免运行时反复轮询 INFORMATION_SCHEMA 的开销。
+func SetDetailCleanupIndexMissing(missing bool) {
+	if missing {
+		detailCleanupIndexMissing.Store(1)
+	} else {
+		detailCleanupIndexMissing.Store(0)
+	}
+}
+
+// detailCleanupBatchParams 返回当前 dialect 下 detail cleanup 批次大小与 batch 间 sleep。
+//
+//   - SQLite:200 / 50ms。SQLite WAL 是单写者锁,大 batch 会让 API INSERT 长时间等待
+//     ("卡死"问题的根因);沿用 v0.13.77 的保守值,验证稳定。
+//   - MySQL 且索引就绪:1000 / 20ms。改完 v14 索引后 SELECT 亚秒级,瓶颈转到 UPDATE
+//     网络往返,大 batch 把往返摊薄到更多行。
+//   - MySQL 但索引缺失(threshold-skip 且没手动建):退化回 200 / 50ms。无索引时 SELECT
+//     是 full-scan-per-batch,大 batch 不会摊薄全扫成本,反而每批次锁更多行;保守批次
+//     +更长 sleep 减小对在线流量的干扰。startup 已经打了告警日志,运维应当尽快建索引。
+func detailCleanupBatchParams(dialector string) (batchSize int, sleep time.Duration) {
+	switch dialector {
+	case "mysql":
+		if detailCleanupIndexMissing.Load() == 1 {
+			return 200, 50 * time.Millisecond
+		}
+		return 1000, 20 * time.Millisecond
+	default:
+		return 200, 50 * time.Millisecond
+	}
+}
+
 // ClearDetailOlderThan 清理指定时间之前请求的详情字段（request_info 和 response_info）
 // statuses 为空时不按状态过滤；非空时仅清理 status IN (statuses) 的记录
 //
@@ -501,10 +543,7 @@ func (r *ProxyRequestRepository) RecalculateCostsFromAttemptsWithProgress(progre
 //   - 分批：request_info/response_info 是大 JSON blob，一次 UPDATE 全表会产生超大
 //     事务（WAL 同时记录 old/new），故按 batchSize 拆分。
 func (r *ProxyRequestRepository) ClearDetailOlderThan(before time.Time, statuses []string) (int64, error) {
-	const (
-		batchSize  = 200
-		batchSleep = 50 * time.Millisecond
-	)
+	batchSize, batchSleep := detailCleanupBatchParams(r.db.Dialector())
 	beforeTs := toTimestamp(before)
 	var total int64
 	var lastCreatedAt int64

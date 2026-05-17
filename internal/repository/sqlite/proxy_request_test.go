@@ -9,6 +9,60 @@ import (
 	"github.com/awsl-project/maxx/internal/domain"
 )
 
+func TestDetailCleanupBatchParams(t *testing.T) {
+	// 子测试间共享全局 detailCleanupIndexMissing,确保不串扰。
+	defer detailCleanupIndexMissing.Store(0)
+
+	t.Run("dialect defaults (index present)", func(t *testing.T) {
+		detailCleanupIndexMissing.Store(0)
+		tests := []struct {
+			dialector string
+			wantBatch int
+			wantSleep time.Duration
+		}{
+			{"sqlite", 200, 50 * time.Millisecond},
+			{"mysql", 1000, 20 * time.Millisecond},
+			{"postgres", 200, 50 * time.Millisecond}, // unknown → conservative defaults
+			{"", 200, 50 * time.Millisecond},
+		}
+		for _, tt := range tests {
+			gotBatch, gotSleep := detailCleanupBatchParams(tt.dialector)
+			if gotBatch != tt.wantBatch || gotSleep != tt.wantSleep {
+				t.Errorf("detailCleanupBatchParams(%q) = (%d, %v), want (%d, %v)",
+					tt.dialector, gotBatch, gotSleep, tt.wantBatch, tt.wantSleep)
+			}
+		}
+	})
+
+	t.Run("MySQL falls back to conservative when index missing", func(t *testing.T) {
+		SetDetailCleanupIndexMissing(true)
+		defer SetDetailCleanupIndexMissing(false)
+		gotBatch, gotSleep := detailCleanupBatchParams("mysql")
+		if gotBatch != 200 || gotSleep != 50*time.Millisecond {
+			t.Errorf("MySQL with missing index = (%d, %v), want (200, 50ms)", gotBatch, gotSleep)
+		}
+	})
+
+	t.Run("SQLite unaffected by MySQL index-missing flag", func(t *testing.T) {
+		SetDetailCleanupIndexMissing(true)
+		defer SetDetailCleanupIndexMissing(false)
+		gotBatch, gotSleep := detailCleanupBatchParams("sqlite")
+		if gotBatch != 200 || gotSleep != 50*time.Millisecond {
+			t.Errorf("SQLite default = (%d, %v), want (200, 50ms)", gotBatch, gotSleep)
+		}
+	})
+
+	// 验证 flag 可恢复:Codex 反馈 sticky flag 会污染后续启动/测试。
+	t.Run("SetDetailCleanupIndexMissing(false) restores fast-path", func(t *testing.T) {
+		SetDetailCleanupIndexMissing(true)
+		SetDetailCleanupIndexMissing(false)
+		gotBatch, gotSleep := detailCleanupBatchParams("mysql")
+		if gotBatch != 1000 || gotSleep != 20*time.Millisecond {
+			t.Errorf("after reset, MySQL = (%d, %v), want (1000, 20ms)", gotBatch, gotSleep)
+		}
+	})
+}
+
 func buildTestProxyRequest(status string, index int) *domain.ProxyRequest {
 	start := time.Unix(int64(index), 0).UTC()
 	return &domain.ProxyRequest{
