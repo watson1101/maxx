@@ -375,10 +375,160 @@ func TestProxyRequestClearDetailOlderThan(t *testing.T) {
 	})
 }
 
-// TestProxyRequestClearDetailOlderThan_UsesPartialIndex 锁定 cleanup 查询确实
-// 走 v13 partial index。回归守护：若有人改回 `id > ?` 游标 + `ORDER BY id`，
-// SQLite planner 会回退到 PK 扫，partial index 形同虚设，该测试会捕获。
-func TestProxyRequestClearDetailOlderThan_UsesPartialIndex(t *testing.T) {
+// TestClearDetailOlderThan_LegacyFallback 守护 sentinel 列缺失时的退化路径。
+//
+// 场景:v15 在大表上 threshold-skip 了 ADD COLUMN,运维没补建。运行期
+// SetDetailClearedColumnMissing(true) 让 ClearDetailOlderThan 走 legacy
+// IS NOT NULL 谓词,不引用不存在的 detail_cleared 列。功能正常但慢。
+//
+// 实现验证:用一个真实的 SQLite DB(列已建),手动 set flag,运行清理,
+// 确认 legacy 谓词路径不报错且能清出数据。
+func TestClearDetailOlderThan_LegacyFallback(t *testing.T) {
+	db, err := NewDBWithDSN("sqlite://:memory:")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	repo := NewProxyRequestRepository(db)
+
+	// 模拟列缺失场景。注意 SQLite 本地其实有列,我们只是逼 ClearDetailOlderThan 走
+	// legacy 路径——legacy 路径不引用列,不报错;清理结果与 sentinel 路径一致。
+	SetDetailClearedColumnMissing(true)
+	defer SetDetailClearedColumnMissing(false)
+
+	old := time.Now().Add(-2 * time.Hour)
+	for i := 0; i < 3; i++ {
+		r := buildTestProxyRequest("COMPLETED", i)
+		if err := repo.Create(r); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if err := db.gorm.Table("proxy_requests").Where("id = ?", r.ID).
+			Update("created_at", old.UnixMilli()+int64(i)).Error; err != nil {
+			t.Fatalf("backdate: %v", err)
+		}
+	}
+
+	cleared, err := repo.ClearDetailOlderThan(time.Now().Add(-time.Hour), nil)
+	if err != nil {
+		t.Fatalf("legacy-path clear: %v", err)
+	}
+	if cleared != 3 {
+		t.Fatalf("legacy-path cleared = %d, want 3", cleared)
+	}
+}
+
+// TestClearDetailOlderThan_StatusBucketIsolation 守护"状态后变的行不会被永久跳过"。
+//
+// 历史 bug:之前的实现在 repo 上持久化 cursor。PENDING 行先被 cursor 越过(status 过滤
+// 不命中),之后转 COMPLETED 时已经在 cursor 后面,永远清不到。Codex 在 PR #568 round 1
+// 抓到。修复:去掉持久化 cursor,只保留 within-call 局部游标 + sentinel 索引。
+//
+// 这个测试模拟:先以 success bucket 清一遍,造一个 PENDING 老行;然后把它转 COMPLETED,
+// 再次清,应该被命中清掉。如果回归到持久化 cursor,这个测试会捕获。
+func TestClearDetailOlderThan_StatusBucketIsolation(t *testing.T) {
+	db, err := NewDBWithDSN("sqlite://:memory:")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	repo := NewProxyRequestRepository(db)
+
+	old := time.Now().Add(-2 * time.Hour)
+	// 三行同时间窗口:一个 COMPLETED, 一个 PENDING (会被 success bucket 跳过), 一个 COMPLETED
+	completed1 := buildTestProxyRequest("COMPLETED", 1)
+	pending := buildTestProxyRequest("PENDING", 2)
+	completed2 := buildTestProxyRequest("COMPLETED", 3)
+	for _, r := range []*domain.ProxyRequest{completed1, pending, completed2} {
+		if err := repo.Create(r); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if err := db.gorm.Table("proxy_requests").Where("id = ?", r.ID).
+			Update("created_at", old.UnixMilli()+int64(r.ID)).Error; err != nil {
+			t.Fatalf("backdate: %v", err)
+		}
+	}
+
+	// 第一次以 success bucket 清。COMPLETED 两条被清,PENDING 跳过(留在 detail_cleared=0)。
+	cleared, err := repo.ClearDetailOlderThan(time.Now().Add(-time.Hour), []string{"COMPLETED"})
+	if err != nil || cleared != 2 {
+		t.Fatalf("first clear: %d, %v (want 2, nil)", cleared, err)
+	}
+
+	// PENDING 行转 FAILED。
+	if err := db.gorm.Table("proxy_requests").Where("id = ?", pending.ID).
+		Update("status", "FAILED").Error; err != nil {
+		t.Fatalf("transition: %v", err)
+	}
+
+	// failed bucket 清。如果有持久化 cursor 把 PENDING 越过了,这里会清不到。
+	cleared, err = repo.ClearDetailOlderThan(time.Now().Add(-time.Hour), []string{"FAILED", "CANCELLED", "REJECTED"})
+	if err != nil || cleared != 1 {
+		t.Fatalf("second clear: %d, %v (want 1, nil) — status transition got skipped by stale cursor?", cleared, err)
+	}
+}
+
+// TestClearDetailOlderThan_RespectsBatchCap 真·cap 测试:把封顶临时调小,验证调用
+// 在 cap × batchSize 行后返回,后续调用接力清完剩余。
+func TestClearDetailOlderThan_RespectsBatchCap(t *testing.T) {
+	db, err := NewDBWithDSN("sqlite://:memory:")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	repo := NewProxyRequestRepository(db)
+
+	// SQLite batch=200,cap=50 → 单次 10000 行。造 10500 行验证 cap 起效太重,改用
+	// 测试钩子把 cap 临时调到 2 实现等价验证。batchSize 也是 200(SQLite default)。
+	origCap := maxCleanupBatchesPerCall
+	maxCleanupBatchesPerCall = 2
+	defer func() { maxCleanupBatchesPerCall = origCap }()
+
+	const seed = 600 // 3 batches with batchSize=200; cap=2 → 第一次清 400, 第二次清 200
+	old := time.Now().Add(-2 * time.Hour)
+	for i := 0; i < seed; i++ {
+		r := buildTestProxyRequest("COMPLETED", i)
+		if err := repo.Create(r); err != nil {
+			t.Fatalf("create %d: %v", i, err)
+		}
+		if err := db.gorm.Table("proxy_requests").Where("id = ?", r.ID).
+			Update("created_at", old.Add(time.Duration(i)*time.Millisecond).UnixMilli()).Error; err != nil {
+			t.Fatalf("backdate %d: %v", i, err)
+		}
+	}
+
+	// 第一次:cap=2 × batchSize=200 = 400 行
+	cleared, err := repo.ClearDetailOlderThan(time.Now().Add(-time.Hour), nil)
+	if err != nil {
+		t.Fatalf("first clear: %v", err)
+	}
+	if cleared != 400 {
+		t.Fatalf("first call cleared = %d, want 400 (cap × batch)", cleared)
+	}
+
+	// 第二次:剩余 200 行,一个 batch 不满就退出
+	cleared, err = repo.ClearDetailOlderThan(time.Now().Add(-time.Hour), nil)
+	if err != nil {
+		t.Fatalf("second clear: %v", err)
+	}
+	if cleared != 200 {
+		t.Fatalf("second call cleared = %d, want 200", cleared)
+	}
+
+	// 第三次:全清完,应该 0
+	cleared, err = repo.ClearDetailOlderThan(time.Now().Add(-time.Hour), nil)
+	if err != nil {
+		t.Fatalf("third clear: %v", err)
+	}
+	if cleared != 0 {
+		t.Fatalf("third call cleared = %d, want 0", cleared)
+	}
+}
+
+// TestProxyRequestClearDetailOlderThan_UsesSentinelIndex 锁定 v15 之后 cleanup
+// SELECT 走 idx_proxy_requests_detail_cleared(detail_cleared, created_at, id) 复合索引。
+// 回归守护:WHERE detail_cleared = 0 是 leading-column 等值匹配,planner 应该挑这个索引;
+// 任何回退到 PK 扫或 TEMP B-TREE 排序都会被捕获。
+func TestProxyRequestClearDetailOlderThan_UsesSentinelIndex(t *testing.T) {
 	db, err := NewDBWithDSN("sqlite://:memory:")
 	if err != nil {
 		t.Fatalf("open db: %v", err)
@@ -386,7 +536,7 @@ func TestProxyRequestClearDetailOlderThan_UsesPartialIndex(t *testing.T) {
 	defer db.Close()
 
 	const sql = `SELECT id, created_at FROM proxy_requests ` +
-		`WHERE created_at < ? AND (request_info IS NOT NULL OR response_info IS NOT NULL) AND dev_mode = 0 ` +
+		`WHERE detail_cleared = 0 AND created_at < ? AND dev_mode = 0 ` +
 		`AND (created_at > ? OR (created_at = ? AND id > ?)) ` +
 		`ORDER BY created_at, id LIMIT 200`
 
@@ -406,19 +556,16 @@ func TestProxyRequestClearDetailOlderThan_UsesPartialIndex(t *testing.T) {
 		planLines = append(planLines, detail)
 	}
 	plan := strings.Join(planLines, "\n")
-	if !strings.Contains(plan, "idx_proxy_requests_detail_cleanup") {
-		t.Fatalf("expected plan to use idx_proxy_requests_detail_cleanup, got:\n%s", plan)
+	if !strings.Contains(plan, "idx_proxy_requests_detail_cleared") {
+		t.Fatalf("expected plan to use idx_proxy_requests_detail_cleared, got:\n%s", plan)
 	}
-	// 显式拒绝 TEMP B-TREE 排序：partial index 的键 (created_at, id) 已经匹配 ORDER BY，
-	// 出现 TEMP B-TREE 意味着 cursor 或 ORDER BY 形状变了，planner 退化到扫+排。
 	if strings.Contains(plan, "TEMP B-TREE") {
 		t.Fatalf("plan should not require TEMP B-TREE sort, got:\n%s", plan)
 	}
 }
 
-// TestProxyUpstreamAttemptClearDetailOlderThan_UsesPartialIndex 同上，针对
-// attempt 表的 cleanup 查询。
-func TestProxyUpstreamAttemptClearDetailOlderThan_UsesPartialIndex(t *testing.T) {
+// TestProxyUpstreamAttemptClearDetailOlderThan_UsesSentinelIndex 同上，针对 attempts 表。
+func TestProxyUpstreamAttemptClearDetailOlderThan_UsesSentinelIndex(t *testing.T) {
 	db, err := NewDBWithDSN("sqlite://:memory:")
 	if err != nil {
 		t.Fatalf("open db: %v", err)
@@ -426,7 +573,7 @@ func TestProxyUpstreamAttemptClearDetailOlderThan_UsesPartialIndex(t *testing.T)
 	defer db.Close()
 
 	const sql = `SELECT id, created_at FROM proxy_upstream_attempts ` +
-		`WHERE created_at < ? AND (request_info IS NOT NULL OR response_info IS NOT NULL) ` +
+		`WHERE detail_cleared = 0 AND created_at < ? ` +
 		`AND (created_at > ? OR (created_at = ? AND id > ?)) ` +
 		`AND EXISTS (SELECT 1 FROM proxy_requests WHERE proxy_requests.id = proxy_upstream_attempts.proxy_request_id AND proxy_requests.dev_mode = 0) ` +
 		`ORDER BY created_at, id LIMIT 200`
@@ -447,11 +594,9 @@ func TestProxyUpstreamAttemptClearDetailOlderThan_UsesPartialIndex(t *testing.T)
 		planLines = append(planLines, detail)
 	}
 	plan := strings.Join(planLines, "\n")
-	if !strings.Contains(plan, "idx_proxy_upstream_attempts_detail_cleanup") {
-		t.Fatalf("expected plan to use idx_proxy_upstream_attempts_detail_cleanup, got:\n%s", plan)
+	if !strings.Contains(plan, "idx_proxy_upstream_attempts_detail_cleared") {
+		t.Fatalf("expected plan to use idx_proxy_upstream_attempts_detail_cleared, got:\n%s", plan)
 	}
-	// 显式拒绝 TEMP B-TREE 排序：EXISTS 改写的全部意义就是避免 planner 从父表驱动后
-	// 再做一次临时排序。若再次出现，说明有人把 EXISTS 改回了 IN 子查询。
 	if strings.Contains(plan, "TEMP B-TREE") {
 		t.Fatalf("plan should not require TEMP B-TREE sort, got:\n%s", plan)
 	}

@@ -448,6 +448,211 @@ var migrations = []Migration{
 			return nil
 		},
 	},
+	{
+		Version:     15,
+		Description: "Add detail_cleared sentinel column + index for cleanup (threshold-skipped on large tables)",
+		Up: func(db *gorm.DB) error {
+			// v15 引入 detail_cleared TINYINT sentinel + 复合索引 (detail_cleared, created_at, id)。
+			// 配合 ClearDetailOlderThan 的 WHERE detail_cleared = 0,planner 走 leading-column
+			// 等值匹配,不必回行评估 LONGTEXT NULL flag。生产上原 43-min stall 的根因。
+			//
+			// **detail_cleared 列由这里的 raw SQL 添加**,不放到 GORM struct 上:
+			// - AutoMigrate 在 RunMigrations 之前运行,放到 struct 上就绕开了 threshold 守护
+			// - 46GB 大表上 5.7 INPLACE ALTER 可能小时级阻塞
+			// - 这里加 threshold-skip + bare ALTER TABLE,运维超阈值时手动跑
+			if err := runDetailClearedColumnMigration(db); err != nil {
+				return err
+			}
+			return runDetailClearedIndexMigration(db)
+		},
+		Down: func(db *gorm.DB) error {
+			// 索引 drop 优先,column 保留(列 DROP 在 MySQL 5.7 / 大表上同样危险,运维手动)。
+			switch db.Dialector.Name() {
+			case "mysql":
+				for _, sql := range []string{
+					"DROP INDEX idx_proxy_requests_detail_cleared ON proxy_requests",
+					"DROP INDEX idx_proxy_upstream_attempts_detail_cleared ON proxy_upstream_attempts",
+				} {
+					if err := db.Exec(sql).Error; err != nil && !isMySQLMissingIndexError(err) {
+						log.Printf("[Migration] Warning: rollback v15 failed sql=%q err=%v", sql, err)
+					}
+				}
+				return nil
+			default:
+				if err := db.Exec("DROP INDEX IF EXISTS idx_proxy_requests_detail_cleared").Error; err != nil {
+					return err
+				}
+				return db.Exec("DROP INDEX IF EXISTS idx_proxy_upstream_attempts_detail_cleared").Error
+			}
+		},
+	},
+}
+
+// runDetailClearedColumnMigration 显式添加 detail_cleared 列到两张大表,带 threshold-skip。
+//
+// 设计要点:
+//   - bare ALTER TABLE ADD COLUMN,无 ALGORITHM/LOCK hint(吸取 v14 1064 教训)。MySQL 5.7+
+//     8.0+ 自动选最优算法
+//   - **列类型显式 TINYINT NOT NULL DEFAULT 0**:GORM 默认会把 Go int 转成 bigint,46GB 表上
+//     每行多耗 7 字节没必要
+//   - 沿用 v13/v14 的 500k 行 threshold:超过则打印 manual SQL,migration 仍标记完成
+//   - 幂等:列已存在则跳过(检测错误码 / 文本)
+func runDetailClearedColumnMigration(db *gorm.DB) error {
+	type tableSpec struct {
+		table string
+		// 列检测的 SQL 与 dialect 相关,统一封装
+	}
+	tables := []string{"proxy_requests", "proxy_upstream_attempts"}
+
+	columnExists := func(table string) (bool, error) {
+		switch db.Dialector.Name() {
+		case "mysql":
+			var n int64
+			err := db.Raw(`
+				SELECT COUNT(*) FROM information_schema.COLUMNS
+				WHERE table_schema = DATABASE() AND table_name = ? AND column_name = 'detail_cleared'
+			`, table).Scan(&n).Error
+			return n > 0, err
+		case "postgres":
+			var n int64
+			err := db.Raw(`
+				SELECT COUNT(*) FROM information_schema.columns
+				WHERE table_schema = current_schema() AND table_name = ? AND column_name = 'detail_cleared'
+			`, table).Scan(&n).Error
+			return n > 0, err
+		default:
+			// SQLite:PRAGMA table_info(...) 列表里找。
+			// 注意:**不要**让 PRAGMA 跑在其它 dialect 上——Postgres 会以 SQLSTATE 42601
+			// 抛出错误并 abort 整个事务,导致 v15 后续 SQL 全部失败。multiinstance CI 抓到。
+			rows, err := db.Raw("PRAGMA table_info(" + table + ")").Rows()
+			if err != nil {
+				return false, err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var cid int
+				var name, ctype string
+				var notnull, pk int
+				var dflt any
+				if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+					return false, err
+				}
+				if name == "detail_cleared" {
+					return true, nil
+				}
+			}
+			return false, nil
+		}
+	}
+
+	for _, table := range tables {
+		exists, err := columnExists(table)
+		if err != nil {
+			log.Printf("[Migration v15] could not probe %s.detail_cleared (%v); skipping column add. Apply manually if needed.", table, err)
+			continue
+		}
+		if exists {
+			continue
+		}
+
+		var rowCount int64
+		if err := db.Raw("SELECT COUNT(*) FROM " + table).Scan(&rowCount).Error; err != nil {
+			log.Printf("[Migration v15] could not count %s (%v); skipping column add.", table, err)
+			continue
+		}
+
+		// 列类型按 dialect:
+		//   - MySQL:TINYINT 1 字节
+		//   - Postgres:SMALLINT 2 字节(没有 TINYINT,SMALLINT 是 16-bit 最小整型)
+		//   - SQLite:整型亲和力,类型名只是 hint,用 TINYINT 与 MySQL 对齐即可
+		columnType := "TINYINT"
+		if db.Dialector.Name() == "postgres" {
+			columnType = "SMALLINT"
+		}
+		ddl := "ALTER TABLE " + table + " ADD COLUMN detail_cleared " + columnType + " NOT NULL DEFAULT 0"
+
+		if rowCount > detailCleanupIndexRowThreshold {
+			log.Printf("[Migration v15] SKIPPING ADD COLUMN on %s: %d rows (> %d threshold). "+
+				"Apply manually during a maintenance window:\n  %s;",
+				table, rowCount, detailCleanupIndexRowThreshold, ddl)
+			continue
+		}
+
+		log.Printf("[Migration v15] adding %s.detail_cleared column (rows=%d)", table, rowCount)
+		start := time.Now()
+		if err := db.Exec(ddl).Error; err != nil {
+			// 列已存在的 MySQL/SQLite 错误吞掉(幂等),其它错误抛出
+			lower := strings.ToLower(err.Error())
+			if strings.Contains(lower, "duplicate column") || strings.Contains(lower, "already exists") {
+				log.Printf("[Migration v15] %s.detail_cleared already exists, skipped", table)
+				continue
+			}
+			return err
+		}
+		log.Printf("[Migration v15] added %s.detail_cleared in %s", table, time.Since(start).Round(time.Millisecond))
+	}
+	return nil
+}
+
+// runDetailClearedIndexMigration 建立 v15 的 sentinel 复合索引。
+//
+// 设计要点:
+//   - 不带 ALGORITHM/LOCK hint:运维强烈要求避免 dialect-specific 语法。MySQL 自己挑算法,
+//     5.7 / 8.0 都跑得通(普通 CREATE INDEX 在两版都是 INPLACE)
+//   - 沿用 v13/v14 的 threshold-skip(500k 行):大表升级路径仍打 manual SQL,运维窗口手动跑
+//   - 不写 SQLite 的 partial index:用普通复合索引,代码路径统一,两 dialect 一致
+//   - 已有同名索引就跳过(幂等)
+func runDetailClearedIndexMigration(db *gorm.DB) error {
+	type tableSpec struct {
+		table string
+		index string
+		ddl   string
+	}
+	specs := []tableSpec{
+		{
+			table: "proxy_requests",
+			index: "idx_proxy_requests_detail_cleared",
+			ddl:   "CREATE INDEX idx_proxy_requests_detail_cleared ON proxy_requests(detail_cleared, created_at, id)",
+		},
+		{
+			table: "proxy_upstream_attempts",
+			index: "idx_proxy_upstream_attempts_detail_cleared",
+			ddl:   "CREATE INDEX idx_proxy_upstream_attempts_detail_cleared ON proxy_upstream_attempts(detail_cleared, created_at, id)",
+		},
+	}
+
+	for _, s := range specs {
+		var rowCount int64
+		if err := db.Raw("SELECT COUNT(*) FROM " + s.table).Scan(&rowCount).Error; err != nil {
+			log.Printf("[Migration v15] could not count %s (%v); skipping %s. Apply manually if needed.", s.table, err, s.index)
+			continue
+		}
+
+		ddl := s.ddl
+		if db.Dialector.Name() != "mysql" {
+			// SQLite 支持 IF NOT EXISTS,显式加上让重复 migration 不报错。
+			ddl = strings.Replace(ddl, "CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1)
+		}
+
+		if rowCount > detailCleanupIndexRowThreshold {
+			log.Printf("[Migration v15] SKIPPING %s build: %s has %d rows (> %d threshold). "+
+				"Apply manually during a maintenance window:\n  %s;",
+				s.index, s.table, rowCount, detailCleanupIndexRowThreshold, s.ddl)
+			continue
+		}
+
+		log.Printf("[Migration v15] building %s (rows=%d)", s.index, rowCount)
+		start := time.Now()
+		if err := db.Exec(ddl).Error; err != nil {
+			if db.Dialector.Name() == "mysql" && isMySQLDuplicateIndexError(err) {
+				log.Printf("[Migration v15] %s already exists, skipped", s.index)
+				continue
+			}
+			return err
+		}
+		log.Printf("[Migration v15] built %s in %s", s.index, time.Since(start).Round(time.Millisecond))
+	}
+	return nil
 }
 
 // runDetailCleanupIndexV2Migration 创建 (status, dev_mode, created_at, id) 索引并删除旧的

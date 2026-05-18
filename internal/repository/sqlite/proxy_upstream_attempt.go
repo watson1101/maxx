@@ -239,17 +239,39 @@ func (r *ProxyUpstreamAttemptRepository) BatchUpdateCosts(updates map[uint64]uin
 // ClearDetailOlderThan 清理指定时间之前 attempt 的详情字段（request_info 和 response_info）
 // statuses 为空时不按状态过滤；非空时仅清理所属 ProxyRequest.status IN (statuses) 的 attempt
 //
-// 关键点：父表过滤用 EXISTS 相关子查询（不是 IN）。SQLite planner 对 IN 子查询会从父表
-// 驱动 → 走 idx_proxy_upstream_attempts_proxy_request_id + USE TEMP B-TREE FOR ORDER BY，
-// partial index 形同虚设；改成 EXISTS 后 planner 走 partial index (created_at<?) +
-// 父表 PK 查找，并且 ORDER BY 不再需要临时 sort。
-// EXPLAIN QUERY PLAN 由 TestProxyUpstreamAttemptClearDetailOlderThan_UsesPartialIndex 守护。
+// 设计三件套（cursor + sentinel + cap）见 ProxyRequestRepository.ClearDetailOlderThan
+// 的详细注释。这里只描述 attempt 特有的逻辑:
+//
+//   - **父表过滤用 EXISTS**:SQLite/MySQL planner 都把 EXISTS 当 anti-join,先驱
+//     attempt 端的 (detail_cleared, created_at, id) 索引,再对每个候选 PK 查父行。
+//     原先 IN(subquery) 形式 SQLite 会从父表驱动,绕开 attempt 端的索引,稳态退化。
+//   - **sentinel**:同 request 表,detail_cleared = 0 是 SELECT 的 leading-column
+//     等值匹配,索引 idx_proxy_upstream_attempts_detail_cleared (detail_cleared,
+//     created_at, id) 让范围扫不回行。
 func (r *ProxyUpstreamAttemptRepository) ClearDetailOlderThan(before time.Time, statuses []string) (int64, error) {
 	batchSize, batchSleep := detailCleanupBatchParams(r.db.Dialector())
 	beforeTs := toTimestamp(before)
+	useSentinel := detailClearedColumnAvailable()
 	var total int64
 	var lastCreatedAt int64
 	var lastID uint64
+
+	// Sentinel vs legacy 谓词分支,见 proxy_request.go 同名函数的注释。
+	selectPred := "detail_cleared = 0 AND created_at < ?"
+	updatePred := "id IN ? AND detail_cleared = 0 AND created_at < ?"
+	updateMap := map[string]any{
+		"request_info":   nil,
+		"response_info":  nil,
+		"detail_cleared": 1,
+	}
+	if !useSentinel {
+		selectPred = "(request_info IS NOT NULL OR response_info IS NOT NULL) AND created_at < ?"
+		updatePred = "id IN ? AND (request_info IS NOT NULL OR response_info IS NOT NULL) AND created_at < ?"
+		updateMap = map[string]any{
+			"request_info":  nil,
+			"response_info": nil,
+		}
+	}
 
 	// parentExistsClause 构造相关 EXISTS：通过 attempt.proxy_request_id 关联父行，
 	// 然后过滤父行 dev_mode/status。返回 SQL 片段 + 对应 args。
@@ -269,12 +291,12 @@ func (r *ProxyUpstreamAttemptRepository) ClearDetailOlderThan(before time.Time, 
 		CreatedAt int64  `gorm:"column:created_at"`
 	}
 
-	for {
+	for batchIdx := 0; batchIdx < maxCleanupBatchesPerCall; batchIdx++ {
 		var rows []cursorRow
 		existsSQL, existsArgs := parentExistsClause()
 		if err := r.db.gorm.Model(&ProxyUpstreamAttempt{}).
 			Select("id, created_at").
-			Where("created_at < ? AND (request_info IS NOT NULL OR response_info IS NOT NULL)", beforeTs).
+			Where(selectPred, beforeTs).
 			Where("(created_at > ? OR (created_at = ? AND id > ?))", lastCreatedAt, lastCreatedAt, lastID).
 			Where(existsSQL, existsArgs...).
 			Order("created_at, id").
@@ -293,15 +315,11 @@ func (r *ProxyUpstreamAttemptRepository) ClearDetailOlderThan(before time.Time, 
 		lastCreatedAt = last.CreatedAt
 		lastID = last.ID
 
-		// 重应用谓词与父表过滤：Pluck 与 UPDATE 之间父请求状态可能变动。
+		updateMap["updated_at"] = time.Now().UnixMilli()
 		result := r.db.gorm.Model(&ProxyUpstreamAttempt{}).
-			Where("id IN ? AND created_at < ? AND (request_info IS NOT NULL OR response_info IS NOT NULL)", ids, beforeTs).
+			Where(updatePred, ids, beforeTs).
 			Where(existsSQL, existsArgs...).
-			Updates(map[string]any{
-				"request_info":  nil,
-				"response_info": nil,
-				"updated_at":    time.Now().UnixMilli(),
-			})
+			Updates(updateMap)
 		if result.Error != nil {
 			return total, result.Error
 		}
@@ -312,6 +330,7 @@ func (r *ProxyUpstreamAttemptRepository) ClearDetailOlderThan(before time.Time, 
 		}
 		time.Sleep(batchSleep)
 	}
+	return total, nil
 }
 
 func (r *ProxyUpstreamAttemptRepository) toModel(a *domain.ProxyUpstreamAttempt) *ProxyUpstreamAttempt {
