@@ -345,61 +345,15 @@ func (r *ProxyRequestRepository) UpdateCost(id uint64, cost uint64) error {
 	return r.db.gorm.Model(&ProxyRequest{}).Where("id = ?", id).Update("cost", cost).Error
 }
 
-// AddCost adds a delta to the cost field of a request (can be negative)
-func (r *ProxyRequestRepository) AddCost(id uint64, delta int64) error {
-	return r.db.gorm.Model(&ProxyRequest{}).Where("id = ?", id).
-		Update("cost", gorm.Expr("cost + ?", delta)).Error
-}
-
-// BatchUpdateCosts updates costs for multiple requests in a single transaction
-func (r *ProxyRequestRepository) BatchUpdateCosts(updates map[uint64]uint64) error {
-	if len(updates) == 0 {
-		return nil
-	}
-
+// UpdateCostAtomically 一个事务里同时更新 proxy_requests.cost 和一批 attempt 的 cost+model_price_id。
+// 保证 proxy_requests.cost == SUM(proxy_upstream_attempts.cost) 这条不变量在中途不会被打破:
+// 如果只用两步独立写,attempt 写完 / request 写失败 会留下父子不一致的窗口,审计后续很难发现。
+func (r *ProxyRequestRepository) UpdateCostAtomically(requestID, requestCost uint64, attemptUpdates map[uint64]domain.AttemptCostUpdate) error {
 	return r.db.gorm.Transaction(func(tx *gorm.DB) error {
-		// Use CASE WHEN for batch update
-		const batchSize = 500
-		ids := make([]uint64, 0, len(updates))
-		for id := range updates {
-			ids = append(ids, id)
+		if err := batchUpdateAttemptCostsInTx(tx, attemptUpdates); err != nil {
+			return err
 		}
-
-		for i := 0; i < len(ids); i += batchSize {
-			end := i + batchSize
-			if end > len(ids) {
-				end = len(ids)
-			}
-			batchIDs := ids[i:end]
-
-			// Build CASE WHEN statement
-			var cases strings.Builder
-			cases.WriteString("CASE id ")
-			args := make([]interface{}, 0, len(batchIDs)*3+1)
-
-			// First: CASE WHEN pairs (id, cost)
-			for _, id := range batchIDs {
-				cases.WriteString("WHEN ? THEN ? ")
-				args = append(args, id, updates[id])
-			}
-			cases.WriteString("END")
-
-			// Second: timestamp for updated_at
-			args = append(args, time.Now().UnixMilli())
-
-			// Third: WHERE IN ids
-			for _, id := range batchIDs {
-				args = append(args, id)
-			}
-
-			sql := fmt.Sprintf("UPDATE proxy_requests SET cost = %s, updated_at = ? WHERE id IN (?%s)",
-				cases.String(), strings.Repeat(",?", len(batchIDs)-1))
-
-			if err := tx.Exec(sql, args...).Error; err != nil {
-				return err
-			}
-		}
-		return nil
+		return tx.Model(&ProxyRequest{}).Where("id = ?", requestID).Update("cost", requestCost).Error
 	})
 }
 
