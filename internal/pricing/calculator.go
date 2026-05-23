@@ -19,13 +19,22 @@ type CostResult struct {
 	Multiplier   uint64 // 实际应用的倍率（10000=1倍）
 }
 
+// HistoricalLookup 通过 DB 反查任意 ModelPriceID(包括已软删的历史快照)。
+// 由仓储层注入,用于按 attempt.ModelPriceID 还原当时的价格做"当时价"重算。
+type HistoricalLookup func(id uint64) (*domain.ModelPrice, error)
+
 // Calculator 维护 modelID → ModelPrice 映射。
 // 启动时载入内置默认价表(ID=0),LoadFromDatabase 会用 DB 记录覆盖同名条目。
 // 这样运行期只有一份价格源,不再有“内置 vs DB”分支。
+//
+// pricesByID 缓存"当前价"行(ID > 0)。需要查历史快照(已软删行)时,
+// CalculateByPriceID 通过 historicalLookup 懒加载到 pricesByID,避免重算
+// 大批 attempt 时打爆 DB。
 type Calculator struct {
-	mu          sync.RWMutex
-	pricesByKey map[string]*domain.ModelPrice
-	pricesByID  map[uint64]*domain.ModelPrice
+	mu               sync.RWMutex
+	pricesByKey      map[string]*domain.ModelPrice
+	pricesByID       map[uint64]*domain.ModelPrice
+	historicalLookup HistoricalLookup
 }
 
 var (
@@ -82,11 +91,57 @@ func (c *Calculator) GetModelPrice(model string) *domain.ModelPrice {
 	return c.lookupLocked(model)
 }
 
-// GetModelPriceByID 按 DB 记录 ID 取价格。
+// GetModelPriceByID 按 DB 记录 ID 取价格(仅看内存缓存,不触发懒加载)。
 func (c *Calculator) GetModelPriceByID(id uint64) *domain.ModelPrice {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.pricesByID[id]
+}
+
+// SetHistoricalLookup 注入历史价反查函数。由仓储装配阶段调用一次,
+// 之后 CalculateByPriceID 在缓存未命中时会经此回填历史快照行。
+func (c *Calculator) SetHistoricalLookup(fn HistoricalLookup) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.historicalLookup = fn
+}
+
+// resolvePriceByID 优先查内存缓存;未命中且配置了 historicalLookup 时
+// 回 DB 取并缓存。
+//   - 返回 (p, nil)     表示命中(p != nil)或确认不存在(p == nil)
+//   - 返回 (nil, err)   表示 DB 查询出错,调用方不得以此为由回退到当前价——
+//     否则会用今天的价格悄悄覆盖历史 attempt 的成本
+func (c *Calculator) resolvePriceByID(id uint64) (*domain.ModelPrice, error) {
+	if id == 0 {
+		return nil, nil
+	}
+	c.mu.RLock()
+	if p, ok := c.pricesByID[id]; ok {
+		c.mu.RUnlock()
+		return p, nil
+	}
+	lookup := c.historicalLookup
+	c.mu.RUnlock()
+
+	if lookup == nil {
+		return nil, nil
+	}
+	p, err := lookup(id)
+	if err != nil {
+		return nil, err
+	}
+	if p == nil {
+		return nil, nil
+	}
+	c.mu.Lock()
+	// 双检:并发情况下别人可能已经填好。
+	if existing, ok := c.pricesByID[id]; ok {
+		c.mu.Unlock()
+		return existing, nil
+	}
+	c.pricesByID[id] = p
+	c.mu.Unlock()
+	return p, nil
 }
 
 // lookupLocked 在 pricesByKey 中查找,先精确再最长前缀。需持有 RLock 或 Lock。
@@ -124,6 +179,38 @@ func (c *Calculator) Calculate(model string, metrics *usage.Metrics, multiplier 
 		return CostResult{Multiplier: multiplier}
 	}
 
+	return applyPrice(price, metrics, multiplier)
+}
+
+// CalculateByPriceID 按指定的 ModelPriceID 取价格快照计算成本——重算路径
+// 用这条:attempt 保存了它写入时的 ModelPriceID,据此还原"当时价" × token
+// × multiplier,而不是按今天的当前价回填。
+//
+// 返回值语义:
+//   - (result, true,  nil): 找到价格快照并完成计算
+//   - (empty,  false, nil): ID=0 或 DB 中确认不存在(p==nil),调用方可安全
+//     回退到按模型名走 Calculate
+//   - (empty,  false, err): historicalLookup 返回错误,调用方必须终止本次
+//     重算并上报错误,不得回退到当前价——否则会用今天的价格覆盖历史成本
+func (c *Calculator) CalculateByPriceID(priceID uint64, metrics *usage.Metrics, multiplier uint64) (CostResult, bool, error) {
+	if multiplier == 0 {
+		multiplier = DefaultMultiplier
+	}
+	if metrics == nil {
+		return CostResult{Multiplier: multiplier}, false, nil
+	}
+	price, err := c.resolvePriceByID(priceID)
+	if err != nil {
+		return CostResult{Multiplier: multiplier}, false, err
+	}
+	if price == nil {
+		return CostResult{Multiplier: multiplier}, false, nil
+	}
+	return applyPrice(price, metrics, multiplier), true, nil
+}
+
+// applyPrice 把 token 用量按指定价格 + 倍率算成 cost,统一两条计算入口。
+func applyPrice(price *domain.ModelPrice, metrics *usage.Metrics, multiplier uint64) CostResult {
 	cost := computeCost(price, metrics)
 	if multiplier != DefaultMultiplier {
 		cost = cost * multiplier / DefaultMultiplier
