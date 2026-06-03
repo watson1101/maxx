@@ -95,14 +95,6 @@ export function getProviderTypeConfig(type: string): ProviderTypeConfig {
   return PROVIDER_TYPE_CONFIGS[type as ProviderTypeKey] || PROVIDER_TYPE_CONFIGS.custom;
 }
 
-export function isOllamaCustomProvider(provider: Provider): boolean {
-  return provider.type === 'custom' && provider.config?.custom?.backend === 'ollama';
-}
-
-export function getProviderDisplayType(provider: Provider): string {
-  return isOllamaCustomProvider(provider) ? 'Ollama' : provider.type;
-}
-
 // 获取显示图标（邮箱或 URL）
 export function getDisplayIcon(type: string): LucideIcon {
   const config = getProviderTypeConfig(type);
@@ -249,8 +241,6 @@ export type ProviderFormData = {
   selectedTemplate: string | null;
   baseURL: string;
   backend: CustomBackend;
-  ollamaNumCtx?: string;
-  ollamaKeepAlive?: string;
   apiKey: string;
   clients: ClientConfig[];
   // Disguise: which client identity to present to the upstream relay.

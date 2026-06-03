@@ -1271,7 +1271,6 @@
     "unfreeze": "解冻",
     "configure": "配置提供商",
     "configureDescription": "设置您的自定义提供商连接",
-    "configureOllamaDescription": "配置本地 Ollama 连接，并通过 maxx 的 Claude-compatible 入口使用",
     "create": "创建提供商",
     "edit": "编辑提供商",
     "editDescription": "更新您的自定义提供商设置",
@@ -1301,10 +1300,6 @@
     "customBackendHttpDesc": "转发到已经支持所选客户端协议的上游服务。",
     "customBackendOllama": "Ollama（Claude-compatible API）",
     "customBackendOllamaDesc": "通过 maxx 的 Claude-compatible 端点暴露 Ollama /api/chat 模型。这不是 Anthropic Claude 模型。",
-    "ollamaNumCtx": "Ollama 上下文窗口（num_ctx）",
-    "ollamaNumCtxDesc": "会转发为 Ollama options.num_ctx。长 Claude Code 任务建议使用 32768。",
-    "ollamaKeepAlive": "Ollama keep_alive",
-    "ollamaKeepAliveDesc": "可选。请求结束后继续保留模型，例如 5m、30m 或 1h。",
     "apiEndpoint": "API 端点",
     "apiKey": "API 密钥",
     "apiKeyEdit": "API 密钥（留空保持当前值）",
@@ -1471,10 +1466,6 @@
     "custom": {
       "name": "自定义提供商",
       "description": "配置您自己的 API 端点"
-    },
-    "ollama": {
-      "name": "Ollama",
-      "description": "本地 Ollama /api/chat，通过 Claude-compatible 入口访问"
     },
     "templates": {
       "88code": {

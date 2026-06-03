@@ -1272,7 +1272,6 @@
     "unfreeze": "Unfreeze",
     "configure": "Configure Provider",
     "configureDescription": "Set up your custom provider connection",
-    "configureOllamaDescription": "Configure a local Ollama connection through maxx's Claude-compatible endpoint",
     "create": "Create Provider",
     "edit": "Edit Provider",
     "editDescription": "Update your custom provider settings",
@@ -1302,10 +1301,6 @@
     "customBackendHttpDesc": "Forward requests to an upstream that already speaks the selected client protocol.",
     "customBackendOllama": "Ollama (Claude-compatible API)",
     "customBackendOllamaDesc": "Expose an Ollama /api/chat model through maxx's Claude-compatible endpoint. This is not an Anthropic Claude model.",
-    "ollamaNumCtx": "Ollama context window (num_ctx)",
-    "ollamaNumCtxDesc": "Forwarded as Ollama options.num_ctx. 32768 is recommended for longer Claude Code tasks.",
-    "ollamaKeepAlive": "Ollama keep_alive",
-    "ollamaKeepAliveDesc": "Optional. Keeps the model loaded after a request, for example 5m, 30m, or 1h.",
     "apiEndpoint": "API Endpoint",
     "apiKey": "API Key",
     "apiKeyEdit": "API Key (leave empty to keep current)",
@@ -1473,10 +1468,6 @@
     "custom": {
       "name": "Custom Provider",
       "description": "Configure your own API endpoint"
-    },
-    "ollama": {
-      "name": "Ollama",
-      "description": "Local Ollama /api/chat through the Claude-compatible endpoint"
     },
     "templates": {
       "88code": {
