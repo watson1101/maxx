@@ -121,6 +121,12 @@ func (r *ProxyRequestRepository) ListCursor(tenantID uint64, limit int, before, 
 		if filter.ProjectID != nil {
 			baseQuery = baseQuery.Where("project_id = ?", *filter.ProjectID)
 		}
+		if filter.StartTime != nil {
+			baseQuery = baseQuery.Where("created_at >= ?", toTimestamp(*filter.StartTime))
+		}
+		if filter.EndTime != nil {
+			baseQuery = baseQuery.Where("created_at <= ?", toTimestamp(*filter.EndTime))
+		}
 	}
 
 	orderBy := "id DESC"
@@ -163,7 +169,7 @@ func (r *ProxyRequestRepository) Count(tenantID uint64) (int64, error) {
 // CountWithFilter 带过滤条件的计数
 func (r *ProxyRequestRepository) CountWithFilter(tenantID uint64, filter *repository.ProxyRequestFilter) (int64, error) {
 	// 如果没有过滤条件且没有 tenantID 过滤，使用缓存的总数
-	if tenantID == domain.TenantIDAll && (filter == nil || (filter.ProviderID == nil && filter.Status == nil && filter.APITokenID == nil && filter.ProjectID == nil)) {
+	if tenantID == domain.TenantIDAll && (filter == nil || filter.IsEmpty()) {
 		return atomic.LoadInt64(&r.count), nil
 	}
 
@@ -182,6 +188,12 @@ func (r *ProxyRequestRepository) CountWithFilter(tenantID uint64, filter *reposi
 		}
 		if filter.ProjectID != nil {
 			query = query.Where("project_id = ?", *filter.ProjectID)
+		}
+		if filter.StartTime != nil {
+			query = query.Where("created_at >= ?", toTimestamp(*filter.StartTime))
+		}
+		if filter.EndTime != nil {
+			query = query.Where("created_at <= ?", toTimestamp(*filter.EndTime))
 		}
 	}
 	if err := query.Count(&count).Error; err != nil {
